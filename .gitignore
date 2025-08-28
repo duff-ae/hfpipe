@@ -1,0 +1,11 @@
+# Data
+data/**
+*.hd5
+out/**
+*.png
+
+# Python cache
+.venv*/
+__pycache__/
+*.pyc
+

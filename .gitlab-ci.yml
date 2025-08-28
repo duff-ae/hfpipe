@@ -1,0 +1,16 @@
+stages: [test]
+
+variables:
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  NUMEXPR_NUM_THREADS: "1"
+
+test:run:
+  stage: test
+  image: python:3.11
+  before_script:
+    - pip install -e .
+  script:
+    - hfpipe run --config configs/fill10843.yaml
+
