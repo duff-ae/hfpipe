@@ -12,42 +12,52 @@ from .decorators import log_step, timeit
 
 LUMITABLE_COLUMNS = tuple(DefaultLumitable.columns.keys())
 
-
 # ----------------------------------------------------------------------
 #  Запись
 # ----------------------------------------------------------------------
 @log_step("save_to_hd5")
 @timeit("save_to_hd5")
-def save_to_hd5(
-    rows: Iterable[Mapping[str, Any]],
-    node: str,
-    path: str,
-    name: str,
-) -> None:
+def save_to_hd5(rows, node: str, path: str, name: str) -> None:
     """
-    Записать данные в HD5-таблицу формата DefaultLumitable.
+    Сохраняет список словарей `rows` в HD5-таблицу `node`
+    по пути `path/name`.
 
-    rows: iterable объектов, поддерживающих доступ по row[col_name]
-          (dict, pandas.Series, numpy.void со dtype.names и т.п.)
-    node: имя таблицы в корне (например 'lumi')
-    path: директория
-    name: имя файла (например 'fill_7920.h5')
+    ВАЖНО: автоматически создаёт все промежуточные директории.
     """
-    os.makedirs(path, exist_ok=True)
+    # Полный путь к файлу
     full_path = os.path.join(path, name)
 
-    # перезаписываем файл (как в старой версии)
-    h5out = open_hd5(full_path, mode='w')
-    try:
-        outtable = get_or_create_lumi_table(h5out, node_name=node)
-        rownew = outtable.row
+    # Гарантируем, что директория существует
+    parent_dir = os.path.dirname(full_path)
+    if parent_dir and not os.path.exists(parent_dir):
+        os.makedirs(parent_dir, exist_ok=True)
 
-        for row in rows:
-            for col in LUMITABLE_COLUMNS:
-                # Требуем, чтобы входной row содержал все эти ключи.
-                # В случае numpy.void можно сделать row[col].
-                value = row[col]
-                rownew[col] = value
+    # Открываем/создаём файл
+    h5out = open_hd5(full_path, mode="w")
+
+    try:
+        # создаём таблицу с нашей схемой
+        if hasattr(h5out.root, node):
+            # на всякий случай удалим старую, если вдруг была
+            h5out.remove_node("/", node)
+
+        filters = tables.Filters(complevel=9, complib="blosc")
+        chunkshape = (100,)
+
+        outtable = h5out.create_table(
+            "/",
+            node,
+            DefaultLumitable,
+            filters=filters,
+            chunkshape=chunkshape,
+        )
+
+        rownew = outtable.row
+        for r in rows:
+            # r – это dict: {column_name: value}
+            for col in DefaultLumitable.columns.keys():
+                if col in r:
+                    rownew[col] = r[col]
             rownew.append()
 
         outtable.flush()

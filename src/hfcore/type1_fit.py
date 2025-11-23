@@ -21,10 +21,15 @@ def _collect_type1_points(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Собирает точки (y, frac) для заданного offset:
-      y     = mu_colliding (bxraw[ibx])
+
+      y     = mu_colliding  = bxraw[ibx]
       frac  = mu_afterglow / mu_colliding = bxraw[ibx+offset] / bxraw[ibx]
-    Использует только строки с avg > sbil_min и только BX,
-    где bx активен, а следующие 'offset' BX неактивны.
+
+    Используем только:
+      - строки, где avg > sbil_min (avg здесь трактуем как SBIL или аналог);
+      - BX, где:
+          active_mask[bx] == 1  (коллайдерный BX)
+        и active_mask[bx+dt] == 0 для dt=1..offset (последующие offset BX неактивны).
     """
     active_mask = np.asarray(active_mask, dtype=np.int32)
     bxraw = np.asarray(bxraw, dtype=np.float64)
@@ -32,7 +37,7 @@ def _collect_type1_points(
 
     assert bxraw.shape[1] == BX_LEN, "bxraw must be (T, BX_LEN)"
 
-    # фильтр по светимости (SBIL)
+    # фильтр по светимости (SBIL / avg)
     mask_sbil = avg > sbil_min
     hists = bxraw[mask_sbil]
     if hists.shape[0] == 0:
@@ -64,15 +69,18 @@ def _collect_type1_points(
     y_vals = []
     frac_vals = []
     for hist in hists:
-        y = hist[colliding_indices]              # mu_colliding
-        y_after = hist[afterglow_indices]        # mu_afterglow
+        y = hist[colliding_indices]       # mu_colliding
+        y_after = hist[afterglow_indices] # mu_afterglow
+
         # избегаем деления на ноль
         mask_nonzero = y > 0.0
         if not np.any(mask_nonzero):
             continue
+
         y = y[mask_nonzero]
         y_after = y_after[mask_nonzero]
         frac = y_after / y
+
         y_vals.append(y)
         frac_vals.append(frac)
 
@@ -93,9 +101,17 @@ def _fit_type1_for_offset(
     order: int,
 ) -> Tuple[float, float, float]:
     """
-    Строит fit Type1Fraction(y) ~ poly_order(y), где y=mu_colliding.
-    Возвращает (p0, p1, p2) для данного offset.
-    Если order < 2, старшие коэффициенты будут 0.
+    Строит фит Type1Fraction(y) ~ poly_order(y), где y = mu_colliding.
+
+    order:
+      1 -> линейный фит  frac ≈ k*y + b
+      2 -> квадратичный  frac ≈ k2*y^2 + k1*y + b
+
+    Возвращает (p0, p1, p2), где:
+      - для order=1: p0 = b,  p1 = k,  p2 = 0
+      - для order=2: p0 = b,  p1 = k1, p2 = k2
+
+    (в таком виде удобно напрямую подставлять в формулу вычитания).
     """
     y_all, frac_all = _collect_type1_points(bxraw, avg, active_mask, offset, sbil_min)
 
@@ -105,14 +121,25 @@ def _fit_type1_for_offset(
 
     # polyfit возвращает [c_k, ..., c_0] для poly(x) = c_k x^k + ... + c_0
     coeffs = np.polyfit(y_all, frac_all, order)
-    # переводим в [c_0, c_1, c_2] (снизу вверх)
-    coeffs = coeffs[::-1]
+    coeffs = coeffs[::-1]  # теперь coeffs[0] = c_0, coeffs[1] = c_1, ...
 
-    # заполняем p0,p1,p2 (поддерживаем максимум квадратичный полином)
+    # линейный случай: frac ≈ k*y + b
+    if order == 1:
+        b = float(coeffs[0])
+        k = float(coeffs[1]) if coeffs.size > 1 else 0.0
+        return b, k, 0.0
+
+    # квадратичный случай: frac ≈ k2*y^2 + k1*y + b
+    if order == 2:
+        b = float(coeffs[0])
+        k1 = float(coeffs[1]) if coeffs.size > 1 else 0.0
+        k2 = float(coeffs[2]) if coeffs.size > 2 else 0.0
+        return b, k1, k2
+
+    # на всякий случай (не должны сюда попадать)
     p0 = float(coeffs[0]) if coeffs.size > 0 else 0.0
     p1 = float(coeffs[1]) if coeffs.size > 1 else 0.0
     p2 = float(coeffs[2]) if coeffs.size > 2 else 0.0
-
     return p0, p1, p2
 
 
@@ -124,13 +151,25 @@ def compute_type1_coeffs(
     active_mask: np.ndarray,
     offsets: Sequence[int],
     sbil_min: float,
-    order: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Считает массивы p0,p1,p2 для всех offsets.
-    Длина массивов = max_offset + 1, индекс t соответствует сдвигу t (BX+i).
-    t=0 оставляем нулевым (для самого коллайдерного BX вычитания нет).
+    Считает массивы p0,p1,p2 и orders для всех offsets.
+
+    Логика порядка фита:
+      - offset == 1 -> quadratric (order = 2)
+      - offset >  1 -> linear     (order = 1)
+
+    Возвращаемые массивы:
+      p0, p1, p2, orders  длиной max_offset+1;
+      индекс t соответствует смещению BX+i, т.е. t=1 -> BX+1 и т.д.
+      t=0 оставляем нулевым (для самого коллайдерного BX вычитания нет).
     """
+    bxraw = np.asarray(bxraw, dtype=np.float64)
+    avg = np.asarray(avg, dtype=np.float64)
+    active_mask = np.asarray(active_mask, dtype=np.int32)
+
+    assert bxraw.ndim == 2 and bxraw.shape[1] == BX_LEN, "bxraw must be (T, BX_LEN)"
+
     if not offsets:
         max_offset = 0
     else:
@@ -139,16 +178,32 @@ def compute_type1_coeffs(
     p0 = np.zeros(max_offset + 1, dtype=np.float64)
     p1 = np.zeros(max_offset + 1, dtype=np.float64)
     p2 = np.zeros(max_offset + 1, dtype=np.float64)
+    orders = np.zeros(max_offset + 1, dtype=np.int32)
 
     for off in offsets:
         if off <= 0:
             continue  # offset=0 не трогаем
-        c0, c1, c2 = _fit_type1_for_offset(bxraw, avg, active_mask, off, sbil_min, order)
+
+        # правило: BX+1 -> квадратичный, остальные -> линейный
+        if off == 1:
+            order = 2
+        else:
+            order = 1
+
+        c0, c1, c2 = _fit_type1_for_offset(
+            bxraw=bxraw,
+            avg=avg,
+            active_mask=active_mask,
+            offset=off,
+            sbil_min=sbil_min,
+            order=order,
+        )
         p0[off] = c0
         p1[off] = c1
         p2[off] = c2
+        orders[off] = order
 
-    return p0, p1, p2
+    return p0, p1, p2, orders
 
 
 def save_type1_coeffs(
@@ -158,21 +213,36 @@ def save_type1_coeffs(
     p1: np.ndarray,
     p2: np.ndarray,
     offsets: Sequence[int],
-    order: int,
+    orders: np.ndarray,
 ) -> str:
     """
-    Сохраняет коэффициенты Type1 в небольшой HDF5-файл.
-    Формат простой: p0, p1, p2, offsets, order.
+    Сохраняет коэффициенты Type1 в небольшой HDF5-файл:
+
+      type1_coeffs_fill{fill}.h5
+
+    Формат:
+      datasets:
+        - "p0", "p1", "p2"     (длины max_offset+1)
+        - "offsets"            (список используемых смещений)
+        - "orders"             (порядок фита для каждого t)
+      attrs:
+        - "fill"
     """
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"type1_coeffs_fill{fill}.h5")
+
+    p0 = np.asarray(p0, dtype=np.float64)
+    p1 = np.asarray(p1, dtype=np.float64)
+    p2 = np.asarray(p2, dtype=np.float64)
+    orders = np.asarray(orders, dtype=np.int32)
+    offsets = np.asarray(offsets, dtype=np.int64)
 
     with h5py.File(path, "w") as h5:
         h5.create_dataset("p0", data=p0)
         h5.create_dataset("p1", data=p1)
         h5.create_dataset("p2", data=p2)
-        h5.create_dataset("offsets", data=np.asarray(offsets, dtype=np.int64))
-        h5.attrs["order"] = int(order)
+        h5.create_dataset("offsets", data=offsets)
+        h5.create_dataset("orders", data=orders)
         h5.attrs["fill"] = int(fill)
 
     return path

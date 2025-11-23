@@ -6,7 +6,7 @@ io:
 
   # Выходные файлы, чтобы не трогать старую версию
   # Будет: /cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_v2/<fill>/<fill>.hd5
-  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_test"
+  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/25"
   output_pattern: "{fill}/{fill}.hd5"
 
   # Имя таблицы в hd5
@@ -23,7 +23,7 @@ steps:
   # 3) вычитание Type1.
   restore_rates: true
   compute_type1: true
-  apply_type1: true
+  apply_type1: false
 
 afterglow:
   lambda_reg: 0.01
@@ -53,6 +53,11 @@ type1:
   # Отступы BX для Type1: j = i+ΔBX
   offsets: [1, 2, 3, 4]
 
-fills:
+#fills:
   # Для теста — один конкретный fill. Потом можно заменить списком stable_fills.
-  - 10709
+#  - 10463-11230
+
+
+
+
+
