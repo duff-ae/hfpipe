@@ -1,2 +1,0 @@
-[console_scripts]
-hfpipe = hfpipe.cli:app
