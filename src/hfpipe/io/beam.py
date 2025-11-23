@@ -140,3 +140,25 @@ def align_masks_to_lumi(lumi_meta: pd.DataFrame, beam: pd.DataFrame,
                 out[miss] = np.stack(beam.iloc[j]["collidable"].to_numpy()).astype(np.int32)
 
     return out
+
+def filter_meta_by_status(
+    meta: pd.DataFrame,
+    bxraw: np.ndarray,
+    beam_df: pd.DataFrame,
+    allowed: list[str] | None
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """
+    Оставить только строки, чей статус ∈ allowed.
+    Если allowed=None или beam_df пуст — вернуть как есть.
+    """
+    if not allowed or beam_df.empty:
+        return meta, bxraw
+
+    # возьмём последнюю запись статуса для каждого ключа
+    b = beam_df[_KEYS + ["status"]].copy()
+    b = b.drop_duplicates(subset=_KEYS, keep="last")
+
+    merged = meta[_KEYS].merge(b, on=_KEYS, how="left")
+    mask = merged["status"].isin(allowed).to_numpy()
+    return meta.loc[mask].reset_index(drop=True), bxraw[mask]
+

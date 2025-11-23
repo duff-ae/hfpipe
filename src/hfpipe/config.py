@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import yaml
 
 @dataclass
@@ -47,12 +47,17 @@ class IOCfg:
     out_dir: str = "./out/"
 
 @dataclass
+class FiltersCfg:
+    status_in: Optional[List[str]] = None  # e.g. ["STABLE BEAMS"] or ["ADJUST","STABLE BEAMS"]
+
+@dataclass
 class AppCfg:
     data: DataCfg
     pipeline: PipelineCfg
     sbr: SbrCfg = SbrCfg()
     plot: PlotCfg = PlotCfg()
     io: IOCfg = IOCfg()
+    filters: FiltersCfg = FiltersCfg()
 
 def load_config(path: str) -> AppCfg:
     with open(path, "r") as f:
@@ -67,4 +72,5 @@ def load_config(path: str) -> AppCfg:
         sbr=SbrCfg(**raw.get("sbr", {})),
         plot=PlotCfg(**raw.get("plot", {})),
         io=IOCfg(**raw.get("io", {})),
+        filters=FiltersCfg(**raw.get("filters", {})),
     )

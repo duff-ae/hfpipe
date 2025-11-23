@@ -8,7 +8,8 @@ from tables import IsDescription, UInt32Col, UInt8Col, StringCol, Float32Col
 
 from .config import load_config
 from .io.hd5 import read_fill_arrays, save_fill_arrays
-from .io.beam import read_beam_fill, pick_fill_mask, align_masks_to_lumi
+from .io.beam import read_beam_fill, pick_fill_mask, align_masks_to_lumi, filter_meta_by_status
+from .core.revert import revert_online
 from .core.utils import nan_to_num_inplace, derive_mask_from_lumi
 from .core.paths import load_hfsbr
 from .core.revert import revert_online
@@ -53,34 +54,39 @@ def run(config: str = typer.Argument(..., help="Path to YAML config file")):
     for fill in cfg.data.fills:
         typer.echo(f"[hfpipe] Processing fill {fill}")
 
-        # ---- Read lumi as (meta, matrix) ----
         meta, bxraw = read_fill_arrays(cfg.data.file_path, fill, cfg.data.node)
-        if len(meta) == 0 or bxraw.size == 0:
-            typer.echo(f"[hfpipe] No lumi rows for fill {fill}, skipping.")
-            continue
-
         nan_to_num_inplace(bxraw)
 
-        # ---- Read beam (may be partial/missing) & build masks ----
-        beam_df = read_beam_fill(cfg.data.beam_path, fill, getattr(cfg.data, "beam_node", None))
+        # 0) (опц) фильтрация по статусу до любых вычислений
+        beam_df_full = read_beam_fill(cfg.data.beam_path, fill, getattr(cfg.data, "beam_node", None))
+        meta, bxraw = filter_meta_by_status(meta, bxraw, beam_df_full, cfg.filters.status_in)
 
-        if beam_df.empty:
-            typer.echo("[hfpipe:beam] beam table not found; deriving mask from lumi mean()")
-            global_mask = derive_mask_from_lumi(bxraw)
-            n_active = int(global_mask.sum())
-        else:
-            global_mask, n_active = pick_fill_mask(beam_df)
+        if len(meta) == 0:
+            typer.echo(f"[hfpipe] No rows after status filter for fill {fill}, skipping.")
+            continue
 
-        record_masks = align_masks_to_lumi(meta, beam_df, global_mask).astype(np.float64, copy=False)
-        global_mask_i32 = global_mask.astype(np.int32, copy=False)
-
-        # ---- Revert online corrections (if enabled) ----
+        # 1) строгий откат онлайн-поправок (inner join + drop)
         rev = cfg.pipeline.revert_online
         if rev.enable:
-            typer.echo("[hfpipe] Reverting online afterglow/pedestal …")
-            revert_online(cfg.data.file_path, fill, meta, bxraw, rev.afterglow_node, rev.pedestal_node)
+            meta, bxraw, dropped = revert_online(
+                cfg.data.file_path, fill, meta, bxraw, rev.pedestal_node, rev.afterglow_node
+            )
+            typer.echo(f"[hfpipe] Revert online: dropped_no_ped={dropped['dropped_no_ped']}, "
+                    f"dropped_no_afterglow={dropped['dropped_no_afterglow']}")
+            if len(meta) == 0:
+                typer.echo(f"[hfpipe] No rows left after revert for fill {fill}, skipping.")
+                continue
             nan_to_num_inplace(bxraw)
 
+        # 2) beam: глобальная маска и per-record маски уже на ОТРЕЗАННОМ meta
+        beam_df = beam_df_full   # можно переиспользовать
+        if beam_df.empty:
+            global_mask = derive_mask_from_lumi(bxraw); n_active = int(global_mask.sum())
+        else:
+            global_mask, n_active = pick_fill_mask(beam_df)
+        record_masks = align_masks_to_lumi(meta, beam_df, global_mask).astype(np.float64, copy=False)
+        global_mask_i32 = global_mask.astype(np.int32, copy=False)
+        
         # ---- BEFORE series (for instant plot) ----
         sbil_before = (bxraw * record_masks).sum(axis=1)
 
@@ -92,6 +98,13 @@ def run(config: str = typer.Argument(..., help="Path to YAML config file")):
                 fill,
                 out=str(plots_root / f"perbx_{fill}_before.png"),
             )
+
+        # ---- Revert online corrections (if enabled) ----
+        rev = cfg.pipeline.revert_online
+        if rev.enable:
+            typer.echo("[hfpipe] Reverting online afterglow/pedestal …")
+            revert_online(cfg.data.file_path, fill, meta, bxraw, rev.afterglow_node, rev.pedestal_node)
+            nan_to_num_inplace(bxraw)
 
         # ---- Batch LSQ (single fill-wide mask) ----
         blsq = cfg.pipeline.batch_afterglow_lsq
