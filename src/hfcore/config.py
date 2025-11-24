@@ -20,8 +20,9 @@ class IOConfig:
     input_pattern: str
     output_dir: str
     output_pattern: str
-    node: str = "lumi"
+    node: str = "hfetlumi"
     active_mask_pattern: str = ""  # "/path/to/activeBXMask_fill{fill}.npy"
+    type1_dir: Optional[str] = None
 
 
 @dataclass
