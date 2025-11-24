@@ -1,12 +1,12 @@
 io:
   # Исходные HFET hd5, по одному файлу на fill
   # Ожидаем путь: /cephfs/brilshare/alshevel/hf_origin/hfet/25/<fill>/<fill>.hd5
-  input_dir: "/cephfs/brilshare/alshevel/hf_origin/hfet/24"
+  input_dir: "/cephfs/brilshare/alshevel/hf_origin/hfet/25"
   input_pattern: "{fill}/{fill}_*.hd5"
 
   # Выходные файлы, чтобы не трогать старую версию
   # Будет: /cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_v2/<fill>/<fill>.hd5
-  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/24"
+  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/25"
   output_pattern: "{fill}/{fill}.hd5"
 
   # Имя таблицы в hd5
@@ -17,7 +17,7 @@ io:
   active_mask_pattern: "/cephfs/brilshare/alshevel/hf_masks/activeBXMask_fill{fill}.npy"
 
   # Type1
-  type1_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/24_type1"
+  type1_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_type1"
 
 steps:
   # Полная физическая процедура:

@@ -1,7 +1,7 @@
 # src/hfcore/config.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import yaml
@@ -9,9 +9,17 @@ import yaml
 
 @dataclass
 class StepsConfig:
-    restore_rates: bool = True
-    compute_type1: bool = True
-    apply_type1: bool = True
+    # 1) восстановление истинных bxraw (afterglow LSQ)
+    restore_rates: bool = False
+
+    # 2) расчёт коэффициентов Type1 (компактные p0/p1/p2)
+    compute_type1: bool = False
+
+    # 3) толстый анализ Type1 (HDF5 + PNG, как старый calculate_type1)
+    analyze_type1: bool = False
+
+    # 4) вычитание Type1 из bxraw (когда допишем apply_type1_step)
+    apply_type1: bool = False
 
 
 @dataclass
@@ -35,12 +43,21 @@ class AfterglowConfig:
     sigvis: Optional[float] = None
 
 
+
 @dataclass
 class Type1Config:
+    # Порог по SBIL (avg/sbil) для отбора точек
     sbil_min: float = 0.1
-    order: int = 1
-    offsets: Optional[List[int]] = None
 
+    # Базовый порядок для компактных коэффициентов (compute_type1_coeffs).
+    # В анализаторе мы всё равно делаем: offset=1 -> 2, остальные -> 1.
+    order: int = 1
+
+    # Список сдвигов BX: j = i + offset
+    offsets: List[int] = field(default_factory=lambda: [1, 2, 3, 4])
+
+    # Рисовать PNG в analyze_type1_step
+    make_plots: bool = False
 
 @dataclass
 class PipelineConfig:
