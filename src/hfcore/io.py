@@ -2,49 +2,71 @@
 from __future__ import annotations
 
 import os
-from typing import Iterable, Mapping, Any, Tuple, Dict
+import glob
+from typing import Iterable, Mapping, Any, Dict
 
 import numpy as np
-import tables, glob
+import tables
 
-from .hd5schema import DefaultLumitable, open_hd5, get_or_create_lumi_table, BX_LEN
+from .hd5schema import DefaultLumitable, open_hd5
 from .decorators import log_step, timeit
 
+# Column names defined by the default lumi table schema.
 LUMITABLE_COLUMNS = tuple(DefaultLumitable.columns.keys())
 
 # ----------------------------------------------------------------------
-#  Запись
+#  Writing
 # ----------------------------------------------------------------------
 @log_step("save_to_hd5")
 @timeit("save_to_hd5")
-def save_to_hd5(rows, node: str, path: str, name: str) -> None:
+def save_to_hd5(
+    rows: Iterable[Mapping[str, Any]],
+    node: str,
+    path: str,
+    name: str,
+) -> None:
     """
-    Сохраняет список словарей `rows` в HD5-таблицу `node`
-    по пути `path/name`.
+    Save a sequence of row dictionaries into an HDF5 table.
 
-    ВАЖНО: автоматически создаёт все промежуточные директории.
+    Parameters
+    ----------
+    rows : iterable of dict
+        Each element is a mapping {column_name: value}. Only columns present
+        in `DefaultLumitable` are written; extra keys in the dict are ignored.
+    node : str
+        Name of the table node under the HDF5 root (e.g. "hfetlumi").
+    path : str
+        Base directory where the file will be created.
+    name : str
+        File name (may include relative subdirectories). The final path is
+        constructed as os.path.join(path, name).
+
+    Notes
+    -----
+    - All intermediate directories are created automatically.
+    - The file is opened in "w" mode, i.e. any existing file with the same
+      name will be overwritten.
     """
-    # Полный путь к файлу
+    # Full file path
     full_path = os.path.join(path, name)
 
-    # Гарантируем, что директория существует
+    # Ensure the parent directory exists
     parent_dir = os.path.dirname(full_path)
     if parent_dir and not os.path.exists(parent_dir):
         os.makedirs(parent_dir, exist_ok=True)
 
-    # Открываем/создаём файл
+    # Open/create HDF5 file
     h5out = open_hd5(full_path, mode="w")
 
     try:
-        # создаём таблицу с нашей схемой
+        # If a node with the same name already exists, drop it first
         if hasattr(h5out.root, node):
-            # на всякий случай удалим старую, если вдруг была
             h5out.remove_node("/", node)
 
         filters = tables.Filters(complevel=9, complib="blosc")
         chunkshape = (100,)
 
-        outtable = h5out.create_table(
+        outtable: tables.Table = h5out.create_table(
             "/",
             node,
             DefaultLumitable,
@@ -54,7 +76,7 @@ def save_to_hd5(rows, node: str, path: str, name: str) -> None:
 
         rownew = outtable.row
         for r in rows:
-            # r – это dict: {column_name: value}
+            # r is a dict: {column_name: value}
             for col in DefaultLumitable.columns.keys():
                 if col in r:
                     rownew[col] = r[col]
@@ -66,23 +88,39 @@ def save_to_hd5(rows, node: str, path: str, name: str) -> None:
 
 
 # ----------------------------------------------------------------------
-#  Чтение в массивы для алгоритмов
+#  Reading into numpy arrays for algorithms
 # ----------------------------------------------------------------------
 @log_step("load_hd5_to_arrays")
 @timeit("load_hd5_to_arrays")
 def load_hd5_to_arrays(directory: str, pattern: str, node: str = "hfetlumi") -> dict:
     """
-    Загружает одну или несколько таблиц `node` из HD5-файлов под заданным паттерном
-    и конкатенирует их по строкам.
+    Load one or more HDF5 tables `node` matching a given pattern and
+    concatenate them along the row axis.
 
-    Пример:
-      directory = "/.../hfet/25/10709"
-      pattern   = "10709_*.hd5"
+    Parameters
+    ----------
+    directory : str
+        Base directory where the HDF5 files live, e.g.
+        "/.../hfet/25/10709".
+    pattern : str
+        File glob pattern relative to `directory`, e.g. "10709_*.hd5".
+    node : str, optional
+        Name of the HDF5 table under the root (default: "hfetlumi").
 
-    Тогда будут прочитаны все файлы /.../hfet/25/10709/10709_*.hd5
-    и таблицы hfetlumi из них будут склеены.
+    Returns
+    -------
+    data : dict[str, np.ndarray]
+        A dictionary mapping column names to numpy arrays. All files are
+        concatenated along axis 0.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no files matching the pattern are found.
+    RuntimeError
+        If a file does not contain the requested node, or if column shapes
+        are inconsistent across files.
     """
-
     full_pattern = os.path.join(directory, pattern)
     paths = sorted(glob.glob(full_pattern))
 
@@ -98,27 +136,27 @@ def load_hd5_to_arrays(directory: str, pattern: str, node: str = "hfetlumi") -> 
                 raise RuntimeError(f"Node '/{node}' not found in {path}")
 
             table: tables.Table = getattr(h5.root, node)
-            # Считываем ВСЕ колонки этой таблицы в numpy
+
+            # Read all columns of this table into numpy arrays
             local_data: dict[str, np.ndarray] = {}
             for colname in table.coldescrs.keys():
-                col = table.col(colname)      # уже готовый np.ndarray
-                local_data[colname] = np.array(col)  # делаем копию на всякий случай
-
+                col = table.col(colname)            # already a numpy array-like
+                local_data[colname] = np.array(col)  # make an explicit copy
         finally:
             h5.close()
 
         if all_data is None:
-            # Первый файл — просто инициализируем
+            # First file: just initialize
             all_data = local_data
         else:
-            # Остальные — конкатенируем по оси 0
+            # Subsequent files: concatenate along axis 0
             for key, arr in local_data.items():
                 if key not in all_data:
-                    # Если вдруг новой колонки раньше не было — просто добавим
+                    # New column that did not exist before: just add it
                     all_data[key] = arr
                     continue
 
-                # Проверим совместимость размерностей (кроме оси 0)
+                # Check compatibility of shapes (except for axis 0)
                 if all_data[key].ndim != arr.ndim:
                     raise RuntimeError(
                         f"Column '{key}' has different ndim across files: "
@@ -133,6 +171,7 @@ def load_hd5_to_arrays(directory: str, pattern: str, node: str = "hfetlumi") -> 
                 all_data[key] = np.concatenate([all_data[key], arr], axis=0)
 
     if all_data is None:
+        # This should not happen given the earlier checks, but keep it explicit
         raise RuntimeError(f"No data loaded from pattern '{full_pattern}'")
 
     return all_data
@@ -140,14 +179,35 @@ def load_hd5_to_arrays(directory: str, pattern: str, node: str = "hfetlumi") -> 
 
 def arrays_to_rows(data: Dict[str, np.ndarray]) -> Iterable[Dict[str, Any]]:
     """
-    Вспомогательная функция: превращает набор numpy-массивов
-    обратно в iterable dict-строк для save_to_hd5.
+    Convert a dictionary of numpy arrays back into an iterable of row dicts
+    suitable for `save_to_hd5`.
 
-    Ожидаем, что все массивы имеют общую длину T по первой оси.
+    Parameters
+    ----------
+    data : dict[str, np.ndarray]
+        Dictionary mapping column names to arrays. All arrays are expected
+        to share the same length T along the first axis.
+
+    Yields
+    ------
+    row : dict[str, Any]
+        Dictionaries with keys corresponding to `LUMITABLE_COLUMNS` and
+        values taken from `data[col][i]` for each row index i.
     """
-    # найдём T по одному из ключей
+    if not data:
+        return
+
+    # Determine the number of rows T from any column
     some_key = next(iter(data.keys()))
     T = data[some_key].shape[0]
+
+    # Optional consistency check: all columns must have the same length
+    for key, arr in data.items():
+        if arr.shape[0] != T:
+            raise RuntimeError(
+                f"arrays_to_rows: column '{key}' has length {arr.shape[0]} "
+                f"but expected {T}"
+            )
 
     for i in range(T):
         row: Dict[str, Any] = {}

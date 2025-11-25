@@ -1,63 +1,61 @@
 io:
-  # Исходные HFET hd5, по одному файлу на fill
-  # Ожидаем путь: /cephfs/brilshare/alshevel/hf_origin/hfet/25/<fill>/<fill>.hd5
+  # Input HFET hd5 files, one file per fill
+  # Expected path: /cephfs/brilshare/alshevel/hf_origin/hfet/25/<fill>/<fill>_*.hd5
   input_dir: "/cephfs/brilshare/alshevel/hf_origin/hfet/25"
   input_pattern: "{fill}/{fill}_*.hd5"
 
-  # Выходные файлы, чтобы не трогать старую версию
-  # Будет: /cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_v2/<fill>/<fill>.hd5
-  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/25"
+  # Output files, to avoid overwriting the old version
+  # Resulting path: /cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_test/<fill>/<fill>.hd5
+  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_test"
   output_pattern: "{fill}/{fill}.hd5"
 
-  # Имя таблицы в hd5
+  # HDF5 node / key with the HFET table
   node: "hfetlumi"
 
-  # Готовая маска активных BX (должна быть shape=(3564,), dtype=int)
-  # Её можно один раз сделать из beam hd5
+  # Precomputed active BX mask (shape=(3564,), dtype=int)
+  # Can be produced once from the beam hd5
   active_mask_pattern: "/cephfs/brilshare/alshevel/hf_masks/activeBXMask_fill{fill}.npy"
 
+  # Directory where Type-1 diagnostic plots (etc.) are stored
+  type1_dir: "/eos/home-a/alshevel/hf_type_plots"
+
 steps:
-  # Полная физическая процедура:
-  # 1) восстановление истинных bxraw (afterglow LSQ);
-  # 2) фит Type1 остатка;
-  # 3) вычитание Type1.
   restore_rates: true
   compute_type1: true
-  apply_type1: false
+  apply_type1: true
 
 afterglow:
+
+  # BX indices to hard-clean (mu_true = 0) – analogue of BX_TO_CLEAN
+  bx_to_clean: [3488, 3489, 3490, 3491, 3553, 3554, 3555, 3556, 3557]
+  
+  hfsbr_pattern: "/eos/home-a/alshevel/hfpipe/input/afterglow/hfet_lsq_test.txt"
+  # Regularization strengths for the LSQ inversion
   lambda_reg: 0.01
   lambda_nonactive: 0.05
-
-  # BX, которые жёстко зачищаем (mu_true=0) – аналог BX_TO_CLEAN
-  bx_to_clean: [3488, 3489, 3490, 3491, 3553, 3554, 3555, 3556, 3557]
-
-  # В старом коде: 'input/afterglow/hfet_lsq_test.txt' — одна и та же матрица на все fill’ы
-  # Здесь можно указать абсолютный путь, без {fill} — format отработает нормально.
-  hfsbr_pattern: "/eos/home-a/alshevel/hfpipe/input/afterglow/hfet_lsq_test.txt"
-
+  
   n_jobs: 16
 
-  # Из твоего куска: sigvis = 3170.19
-  # bx = bxraw * 11245.6 / sigvis
+  # From your note: sigvis = 3170.19
+  # Conversion example: bx = bxraw * 11245.6 / sigvis
   sigvis: 3170.19
 
 type1:
-  # Порог по светимости (аналог sbil_min): берём только строки с avg>0.1
-  sbil_min: 0.1
-
-  # Порядок полинома: у тебя для type=1 (offset=1) был quad=2, для остальных – 1.
-  # Мы в новом коде пока используем один общий order. Можно начать с 1:
-  order: 1
-
-  # Отступы BX для Type1: j = i+ΔBX
+  # Offsets (in BX) between the main bunch and the tail to be fitted
   offsets: [1, 2, 3, 4]
 
-#fills:
-  # Для теста — один конкретный fill. Потом можно заменить списком stable_fills.
-#  - 10463-11230
+  # Minimum SBIL for including a point in the Type-1 fit
+  sbil_min: 0.1
 
+  # Whether to produce Type-1 summary plots
+  make_plots: true
 
+  debug: true             # draw "before" Type-1 plots directly in compute_type1_step
+  debug_after_apply: true # draw "after" Type-1 plots in apply_type1_step
 
+  # Do not store heavy intermediate type1_{offset}.h5 files
+  save_hd5: false
 
-
+fills:
+  # For testing: run over a single fill. Later this can be replaced by a list of stable fills.
+  - 11164

@@ -59,6 +59,10 @@ class Type1Config:
     # Рисовать PNG в analyze_type1_step
     make_plots: bool = False
 
+    debug: bool = False
+    debug_after_apply: bool = False
+    save_hd5: bool = False
+
 @dataclass
 class PipelineConfig:
     io: IOConfig
