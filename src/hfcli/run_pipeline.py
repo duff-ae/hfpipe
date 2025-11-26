@@ -7,6 +7,7 @@ import os
 
 from hfcore.config import load_config
 from hfcore.pipeline import run_many_fills
+from hfcore.banner import print_md_flag_banner
 
 log = logging.getLogger("hfpipe.run_pipeline")
 
@@ -83,6 +84,12 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+    )
+
+    print_md_flag_banner(
+        title="HF Analysis & Reprocessing Tool",
+        subtitle="BRIL · University of Maryland, College Park",
+        version="0.1.0",  # можешь подтянуть из hfcore.__init__.__version__
     )
 
     cfg = load_config(args.config)

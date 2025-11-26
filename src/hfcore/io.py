@@ -142,6 +142,10 @@ def load_hd5_to_arrays(directory: str, pattern: str, node: str = "hfetlumi") -> 
             for colname in table.coldescrs.keys():
                 col = table.col(colname)            # already a numpy array-like
                 local_data[colname] = np.array(col)  # make an explicit copy
+
+            if "bxraw" not in local_data and "data" in local_data:
+                local_data["bxraw"] = local_data.pop("data")
+
         finally:
             h5.close()
 

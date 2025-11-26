@@ -1,50 +1,64 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import os
 import glob
 import argparse
 import logging
+from typing import List, Optional
 
 import numpy as np
 import tables
 
+from hfcore.hd5schema import BX_LEN
+
 log = logging.getLogger("hfpipe.generate_masks")
 
-def autodetect_fills(beam_path: str) -> list[int]:
+# ----------------------------------------------------------------------
+#  Helpers
+# ----------------------------------------------------------------------
+
+def autodetect_fills(beam_path: str) -> List[int]:
     """
-    Находит все подпапки вида beam_path/<fill>/, где <fill> — число.
-    Возвращает отсортированный список fill-номеров.
+    Detect all subdirectories of the form beam_path/<fill>/ where <fill> is an integer.
+
+    Returns
+    -------
+    fills : list[int]
+        Sorted list of discovered fill numbers.
     """
     pattern = os.path.join(beam_path, "*")
     dirs = [d for d in glob.glob(pattern) if os.path.isdir(d)]
 
-    fills: list[int] = []
+    fills: List[int] = []
     for d in dirs:
         base = os.path.basename(d)
         try:
             fills.append(int(base))
         except ValueError:
-            # игнорируем папки с нечисловыми именами
+            # Ignore non-numeric subdirectories
             continue
 
     fills.sort()
     return fills
 
+
 def decode_status(value) -> str:
-    """bytes -> str, str -> str."""
+    """
+    Decode a 'status' field from the beam table to str.
+
+    Accepts bytes or str, always returns str.
+    """
     if isinstance(value, bytes):
         return value.decode("utf-8")
     return str(value)
 
 
-def iter_beam_files_for_fill(beam_path: str, fill: int) -> list[str]:
+def iter_beam_files_for_fill(beam_path: str, fill: int) -> List[str]:
     """
-    Возвращает список *.hd5 для данного fill в beam_path/<fill>/.
+    Return a sorted list of *.hd5 files for a given fill under beam_path/<fill>/.
 
-    Если директории нет – отдаём пустой список.
+    If the directory does not exist, an empty list is returned.
     """
     fill_dir = os.path.join(beam_path, str(fill))
     if not os.path.isdir(fill_dir):
@@ -55,17 +69,20 @@ def iter_beam_files_for_fill(beam_path: str, fill: int) -> list[str]:
     return files
 
 
-def build_active_mask_for_fill(beam_path: str, fill: int) -> np.ndarray | None:
+def build_active_mask_for_fill(beam_path: str, fill: int) -> Optional[np.ndarray]:
     """
-    Пытается построить activeBXMask для данного fill.
+    Try to build an active BX mask (activeBXMask) for a given fill.
 
-    Логика:
-      - перебираем все файлы beam_path/<fill>/*.hd5
-      - в каждом ищем таблицу /beam
-      - в /beam ищем первую строку, где fillnum==fill и status=='STABLE BEAMS'
-      - берём row['collidable'] как activeBXMask
+    Logic
+    -----
+    - Iterate over all files beam_path/<fill>/*.hd5
+    - In each file, look for the /beam table
+    - In /beam, search for the first row where:
+        * row["fillnum"] == fill
+        * row["status"] == "STABLE BEAMS"
+    - Take row["collidable"] as the activeBXMask.
 
-    Если ни в одном файле нет /beam или нужной строки – возвращаем None.
+    If no suitable row is found in any file, returns None.
     """
     candidates = iter_beam_files_for_fill(beam_path, fill)
     if not candidates:
@@ -85,7 +102,7 @@ def build_active_mask_for_fill(beam_path: str, fill: int) -> np.ndarray | None:
                 table: tables.Table = h5.root.beam
                 log.info("[fill %d] using table '%s'", fill, table._v_pathname)
 
-                selected_mask: np.ndarray | None = None
+                selected_mask: Optional[np.ndarray] = None
 
                 for row in table.iterrows():
                     row_fill = int(row["fillnum"])
@@ -109,11 +126,12 @@ def build_active_mask_for_fill(beam_path: str, fill: int) -> np.ndarray | None:
                     )
                     continue
 
-                if selected_mask.shape[0] != 3564:
+                if selected_mask.shape[0] != BX_LEN:
                     log.warning(
-                        "[fill %d] collidable length=%d != 3564",
+                        "[fill %d] collidable length=%d != BX_LEN=%d",
                         fill,
                         selected_mask.shape[0],
+                        BX_LEN,
                     )
 
                 return selected_mask
@@ -126,9 +144,9 @@ def build_active_mask_for_fill(beam_path: str, fill: int) -> np.ndarray | None:
                 e,
                 exc_info=True,
             )
-            # Переходим к следующему файлу
+            # Try next file
 
-    # Если дошли сюда – ни один файл не дал маску
+    # If we get here, no suitable /beam row was found
     log.error(
         "[fill %d] no suitable /beam table with STABLE BEAMS found in any file",
         fill,
@@ -136,16 +154,20 @@ def build_active_mask_for_fill(beam_path: str, fill: int) -> np.ndarray | None:
     return None
 
 
-def main():
+# ----------------------------------------------------------------------
+#  CLI
+# ----------------------------------------------------------------------
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate activeBXMask_fill{fill}.npy from beam HD5 files"
+        description="Generate activeBXMask_fill{fill}.npy from beam HD5 files."
     )
     parser.add_argument(
         "--beam-path",
         required=True,
         help=(
-            "Base path to beam HD5 files "
-            "(e.g. /eos/cms/store/group/dpg_bril/comm_bril/2025/physics/)"
+            "Base path to beam HD5 files, e.g. "
+            "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics/"
         ),
     )
     parser.add_argument(
@@ -157,7 +179,10 @@ def main():
         "--fills",
         nargs="+",
         type=int,
-        help="List of fills to process (e.g. 9973 9974 9975). If omitted, autodetect from beam-path.",
+        help=(
+            "List of fills to process (e.g. 9973 9974 9975). "
+            "If omitted, fills are autodetected from subdirectories of --beam-path."
+        ),
     )
 
     args = parser.parse_args()
@@ -169,7 +194,7 @@ def main():
 
     os.makedirs(args.mask_dir, exist_ok=True)
 
-    # если филлы не заданы руками — автоопределяем по подпапкам в beam_path
+    # If fills are not provided explicitly, autodetect from beam_path
     if args.fills is not None:
         fills = args.fills
     else:
@@ -201,7 +226,8 @@ def main():
                 int(mask.sum()),
             )
         except Exception as e:
-            log.error(f"[fill {fill}] FAILED: {e}", exc_info=True)
+            log.error("[fill %d] FAILED: %s", fill, e, exc_info=True)
+
 
 if __name__ == "__main__":
     main()
