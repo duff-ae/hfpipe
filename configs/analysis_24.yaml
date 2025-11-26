@@ -4,7 +4,7 @@ io:
   input_pattern: "{fill}/{fill}_*.hd5"
 
   # Output files, to avoid overwriting the old version
-  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/24_test"
+  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/24"
   output_pattern: "{fill}/{fill}.hd5"
 
   # HDF5 node / key with the HFET table
