@@ -6,6 +6,7 @@ from typing import List
 import numpy as np
 import logging
 import h5py
+import copy
 
 from .decorators import log_step, timeit
 from .io import load_hd5_to_arrays, arrays_to_rows, save_to_hd5
@@ -13,6 +14,7 @@ from .hd5schema import BX_LEN
 from .afterglow_lsq import build_afterglow_solver_from_file
 from .type1_fit import compute_type1_coeffs, save_type1_coeffs, analyze_type1_step
 from .type1_apply import apply_type1_batch
+from .plotter import plot_hist_bx, plot_lumi_comparison
 
 from .config import PipelineConfig
 
@@ -400,6 +402,15 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
             fill,
         )
 
+    # plot the uncorrected rates
+    # TODO likely will want to use a different flag
+    # TODO also need to tell the plot which year this is
+    if cfg.type1.make_plots:
+        plot_hist_bx(data, cfg, fill, 'Uncorr. Luminosity')
+
+        # save the uncorrected rates for later comparison
+        data_origin = copy.deepcopy(data)
+
     # --- 2) pipeline steps ---
     if cfg.steps.restore_rates:
         data = restore_rates_step(data, cfg, active_mask)
@@ -409,6 +420,13 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
 
     if cfg.steps.apply_type1:
         data = apply_type1_step(data, cfg, active_mask, fill)
+
+    # plot the corrected rates
+    # TODO likely will want to use a different flag
+    # TODO also need to tell the plot which year this is
+    if cfg.type1.make_plots:
+        plot_hist_bx(data, cfg, fill, 'Corr. Luminosity')
+        plot_lumi_comparison(data, data_origin, cfg, active_mask, fill)
 
     # --- 3) save result ---
     rows = arrays_to_rows(data)

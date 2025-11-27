@@ -1,2 +1,6 @@
+[project]
+name = "hfpipe"
+version = "0.1.0"
+
 [project.scripts]
 hfpipe-run = "hfcli.run_pipeline:main"
