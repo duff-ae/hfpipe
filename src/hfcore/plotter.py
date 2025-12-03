@@ -7,9 +7,25 @@ hep.style.use(hep.style.ROOT)
 hep.style.use(hep.style.CMS)
 
 
+def create_figure(x_axis, y_axis, fill, year=2025, plot_type='Preliminary'):
+    fig = plt.figure(figsize=(8, 6))
+    plt.rcParams.update({"font.size": 14})
+
+    rlabel = f"Fill {fill} ({year}, 13.6 TeV)"
+    cms_status = "Preliminary"
+    petroff_10 = ["#3f90da", "#ffa90e", "#bd1f01", "#94a4a2", "#832db6", "#a96b59", "#e76300", "#b9ac70", "#717581", "#92dadd"]
+    plt.rcParams["axes.prop_cycle"] = plt.cycler('color', petroff_10)
+    pad_inches = 0.5
+
+    hep.cms.label(cms_status, loc=0, data=True, year=year, rlabel=rlabel)
+
+    plt.xlabel(x_axis)
+    plt.ylabel(y_axis)
+
+    return fig
+
 def create_double_figure(x_axis, y_axis1, y_axis2, fill, ratio=2, year=2025, plot_type='Preliminary'):
     fig, ax = plt.subplots(nrows=2, sharex=True, figsize=(10, 8), gridspec_kw={'height_ratios': [ratio, 1]})
-
     plt.rcParams.update({"font.size": 14})
 
     rlabel = f"Fill {fill} ({year}, 13.6 TeV)"
@@ -81,6 +97,8 @@ def plot_lumi_comparison(data, data_origin, cfg, active_mask, fill):
 
     index = np.arange(len(hists))
 
+    # TODO need to pass the year here
+    # TODO can also probably add whether the plots are preliminary to the config
     fig, ax = create_double_figure('Fill duration [s]', 'Instantenious luminosity [Hz/µb]', '', fill)
 
     ax[0].plot(index, avg, '.', label='Corr. instantenious luminosity')
@@ -102,5 +120,56 @@ def plot_lumi_comparison(data, data_origin, cfg, active_mask, fill):
     os.makedirs(output_dir, exist_ok=True)
 
     png_path = os.path.join(output_dir, f"instantaneous.png")
+    plt.savefig(png_path, dpi=300)
+    plt.close(fig)
+
+"""
+    Plot residuals
+"""
+def plot_residuals(data, cfg, active_mask, fill):
+    hists = np.stack(data['bxraw']) * 11245.6 / cfg.afterglow.sigvis
+    
+    # calculate the inst lumi
+    avg_col     = np.array([np.multiply(hist, active_mask).sum() for hist in hists])
+
+    prev_is_col = np.roll(active_mask, 1)
+    bxp1_idx    = ((~active_mask) & prev_is_col)
+    bxp2_idx    = np.roll(bxp1_idx, 1)
+    bxt2_idx    = ((~active_mask) & (~bxp1_idx) & (~bxp2_idx))
+
+    # calculate the residuals
+    avg_t1p1 = np.array([np.multiply(hist, bxp1_idx).mean() for hist in hists])
+    avg_t1p2 = np.array([np.multiply(hist, bxp2_idx).mean() for hist in hists])
+    avg_t2   = np.array([np.multiply(hist, bxt2_idx).mean() for hist in hists])
+    
+    # get the path to save plots
+    plot_dir = getattr(cfg.io, "type1_dir", None)
+    if plot_dir is None:
+        plot_dir = os.path.join(cfg.io.output_dir, "type1")
+
+    output_dir = os.path.join(plot_dir, str(fill))
+    os.makedirs(output_dir, exist_ok=True)
+
+    # p1 residuals plot
+    fig = create_figure('Instantenious luminosity [Hz/µb]', 'p1 Residuals [Hz/µb]', fill)
+    plt.plot(avg_col, avg_t1p1, '.')
+
+    png_path = os.path.join(output_dir, f"p1_residuals.png")
+    plt.savefig(png_path, dpi=300)
+    plt.close(fig)
+
+    # p2 residuals plot
+    fig = create_figure('Instantenious luminosity [Hz/µb]', 'p2 Residuals [Hz/µb]', fill)
+    plt.plot(avg_col, avg_t1p2, '.')
+
+    png_path = os.path.join(output_dir, f"p2_residuals.png")
+    plt.savefig(png_path, dpi=300)
+    plt.close(fig)
+
+    # t2 residuals plot
+    fig = create_figure('Instantenious luminosity [Hz/µb]', 'T2 Residuals [Hz/µb]', fill)
+    plt.plot(avg_col, avg_t2, '.')
+
+    png_path = os.path.join(output_dir, f"T2_residuals.png")
     plt.savefig(png_path, dpi=300)
     plt.close(fig)

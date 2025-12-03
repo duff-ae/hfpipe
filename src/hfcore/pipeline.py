@@ -14,7 +14,7 @@ from .hd5schema import BX_LEN
 from .afterglow_lsq import build_afterglow_solver_from_file
 from .type1_fit import compute_type1_coeffs, save_type1_coeffs, analyze_type1_step
 from .type1_apply import apply_type1_batch
-from .plotter import plot_hist_bx, plot_lumi_comparison
+from .plotter import plot_hist_bx, plot_lumi_comparison, plot_residuals
 
 from .config import PipelineConfig
 
@@ -427,6 +427,7 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
     if cfg.type1.make_plots:
         plot_hist_bx(data, cfg, fill, 'Corr. Luminosity')
         plot_lumi_comparison(data, data_origin, cfg, active_mask, fill)
+        plot_residuals(data, cfg, active_mask, fill)
 
     # --- 3) save result ---
     rows = arrays_to_rows(data)
