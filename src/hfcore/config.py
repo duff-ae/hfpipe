@@ -25,6 +25,7 @@ class StepsConfig:
 @dataclass
 class IOConfig:
     input_dir: str
+    beam_dir: str
     input_pattern: str
     output_dir: str
     output_pattern: str

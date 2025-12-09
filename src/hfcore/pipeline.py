@@ -14,7 +14,7 @@ from .hd5schema import BX_LEN
 from .afterglow_lsq import build_afterglow_solver_from_file
 from .type1_fit import compute_type1_coeffs, save_type1_coeffs, analyze_type1_step
 from .type1_apply import apply_type1_batch
-from .plotter import plot_hist_bx, plot_lumi_comparison, plot_residuals
+from .plotter import plot_hist_bx, plot_lumi_comparison, plot_residuals, plot_lasers
 
 from .config import PipelineConfig
 
@@ -356,6 +356,9 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
 
     # --- 1) load input data (may contain multiple files and multiple fills) ---
     data = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.io.node)
+    
+    # TODO beam table is missing from fill???
+    #beam = load_hd5_to_arrays(cfg.io.beam_dir, input_name, node='beam')
 
     # --- 1a) keep only rows corresponding to the current fill ---
     fill_arr = data.get("fillnum", None)
@@ -415,6 +418,11 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
     if cfg.steps.restore_rates:
         data = restore_rates_step(data, cfg, active_mask)
 
+    # plot after t2 but before t1
+    if cfg.type1.make_plots:
+        plot_hist_bx(data, cfg, fill, 'T2 Corr. Luminosity')
+        plot_residuals(data, cfg, active_mask, fill, 't2_corr')
+    
     if cfg.steps.compute_type1:
         data = compute_type1_step(data, cfg, active_mask, fill)
 
@@ -425,9 +433,10 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
     # TODO likely will want to use a different flag
     # TODO also need to tell the plot which year this is
     if cfg.type1.make_plots:
-        plot_hist_bx(data, cfg, fill, 'Corr. Luminosity')
+        plot_hist_bx(data, cfg, fill, 'T2 and T1 Corr. Luminosity')
         plot_lumi_comparison(data, data_origin, cfg, active_mask, fill)
-        plot_residuals(data, cfg, active_mask, fill)
+        plot_residuals(data, cfg, active_mask, fill, 'full_corr')
+        plot_lasers(data, data_origin, cfg, active_mask, fill)
 
     # --- 3) save result ---
     rows = arrays_to_rows(data)

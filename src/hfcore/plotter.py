@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 import os
 import mplhep as hep
 
+from .hd5schema import BX_LEN
+
 hep.style.use(hep.style.ROOT)
 hep.style.use(hep.style.CMS)
 
@@ -56,7 +58,8 @@ def plot_hist_bx(data, cfg, fill, label):
     fig, ax = create_double_figure('BCID', 'Instantaneous luminosity [Hz/ub]', '', fill)
 
     # TODO I do not understand the reason for this (just copied from the old code)
-    hist = [x * 11245.6/cfg.afterglow.sigvis if abs(x) < 1e3 else 0 for x in np.stack(data['bxraw']).mean(axis=0)]
+    #hist = [x * 11245.6/cfg.afterglow.sigvis if abs(x) < 1e3 else 0 for x in np.stack(data['bxraw']).mean(axis=0)]
+    hist = [x * 11245.6/cfg.afterglow.sigvis for x in np.stack(data['bxraw']).mean(axis=0)]
 
     ax[0].bar(list(range(3564)), hist, label=label)
     ax[1].bar(list(range(3564)), hist, label=label)
@@ -66,12 +69,12 @@ def plot_hist_bx(data, cfg, fill, label):
 
     plt.tight_layout()
 
-    if label == 'Corr. Luminosity':
+    if 'Corr. Luminosity' in label:
         ax[1].set_ylim(-0.5, 0.5)
-        ax[1].set_xlim(0, 500)
     else:
         ax[1].set_ylim(-0.5, 2)
-        ax[1].set_xlim(0, 500)
+    
+    #ax[1].set_xlim(0, 500) # TODO remove
 
     # TODO this should be changed to a dedicated plotting directory
     plot_dir = getattr(cfg.io, "type1_dir", None)
@@ -126,21 +129,23 @@ def plot_lumi_comparison(data, data_origin, cfg, active_mask, fill):
 """
     Plot residuals
 """
-def plot_residuals(data, cfg, active_mask, fill):
+def plot_residuals(data, cfg, active_mask, fill, label):
     hists = np.stack(data['bxraw']) * 11245.6 / cfg.afterglow.sigvis
     
     # calculate the inst lumi
-    avg_col     = np.array([np.multiply(hist, active_mask).sum() for hist in hists])
+    avg_col     = np.array([np.multiply(hist, active_mask).mean() for hist in hists])
 
     prev_is_col = np.roll(active_mask, 1)
     bxp1_idx    = ((~active_mask) & prev_is_col)
     bxp2_idx    = np.roll(bxp1_idx, 1)
     bxt2_idx    = ((~active_mask) & (~bxp1_idx) & (~bxp2_idx))
+    bxt2_idx[np.asarray(cfg.afterglow.bx_to_clean, dtype=np.int64)] = False 
 
     # calculate the residuals
     avg_t1p1 = np.array([np.multiply(hist, bxp1_idx).mean() for hist in hists])
     avg_t1p2 = np.array([np.multiply(hist, bxp2_idx).mean() for hist in hists])
     avg_t2   = np.array([np.multiply(hist, bxt2_idx).mean() for hist in hists])
+    #avg_t2   = np.array([np.sum(bxt2_idx) for hist in hists])
     
     # get the path to save plots
     plot_dir = getattr(cfg.io, "type1_dir", None)
@@ -151,25 +156,98 @@ def plot_residuals(data, cfg, active_mask, fill):
     os.makedirs(output_dir, exist_ok=True)
 
     # p1 residuals plot
-    fig = create_figure('Instantenious luminosity [Hz/µb]', 'p1 Residuals [Hz/µb]', fill)
+    fig = create_figure('Mean SBIL [Hz/µb]', 'p1 Residuals [Hz/µb]', fill)
     plt.plot(avg_col, avg_t1p1, '.')
 
-    png_path = os.path.join(output_dir, f"p1_residuals.png")
+    png_path = os.path.join(output_dir, f"p1_residuals_{label}.png")
     plt.savefig(png_path, dpi=300)
     plt.close(fig)
 
     # p2 residuals plot
-    fig = create_figure('Instantenious luminosity [Hz/µb]', 'p2 Residuals [Hz/µb]', fill)
+    fig = create_figure('Mean SBIL [Hz/µb]', 'p2 Residuals [Hz/µb]', fill)
     plt.plot(avg_col, avg_t1p2, '.')
 
-    png_path = os.path.join(output_dir, f"p2_residuals.png")
+    png_path = os.path.join(output_dir, f"p2_residuals_{label}.png")
     plt.savefig(png_path, dpi=300)
     plt.close(fig)
 
     # t2 residuals plot
-    fig = create_figure('Instantenious luminosity [Hz/µb]', 'T2 Residuals [Hz/µb]', fill)
+    fig = create_figure('Mean SBIL [Hz/µb]', 'Type 2 Residuals [Hz/µb]', fill)
     plt.plot(avg_col, avg_t2, '.')
 
-    png_path = os.path.join(output_dir, f"T2_residuals.png")
+    png_path = os.path.join(output_dir, f"t2_residuals_{label}.png")
     plt.savefig(png_path, dpi=300)
     plt.close(fig)
+
+def plot_lasers(data, data_origin, cfg, active_mask, fill):
+    hists = np.stack(data['bxraw']) * 11245.6 / cfg.afterglow.sigvis
+    hists_origin = np.stack(data_origin['bxraw']) * 11245.6 / cfg.afterglow.sigvis
+
+    avg = np.array([np.multiply(hist, active_mask).sum() for hist in hists])
+    avg_origin = np.array([np.multiply(hist, active_mask).sum() for hist in hists_origin])
+
+    # TODO the beam table is missing from fill for some reason
+    #intensity1 = np.stack(data['intensity']).flatten()
+    #intensity2 = np.stack(data_origin['intensity']).flatten()
+
+    index = np.arange(len(hists))
+    
+    # hardcoded; these are always the same
+    laser_bcid = [3489, 3490, 3491, 3492]
+    
+    # laser "control" region — time evolution
+    fig, ax = create_double_figure('Fill duration [s]', 'Uncorrected', 'Corrected', fill, ratio=1)
+
+    for bcid in laser_bcid:
+        ax[0].plot(index, hists_origin[:, bcid], '.', label=f'LASER BCID {bcid}')
+        ax[1].plot(index, hists[:, bcid], '.', label=f'LASER BCID {bcid}')
+
+    ax[0].legend(loc='upper right', frameon=False, fontsize=12)
+    ax[1].legend(loc='upper right', frameon=False, fontsize=12)
+    
+    # get the path to save plots
+    plot_dir = getattr(cfg.io, "type1_dir", None)
+    if plot_dir is None:
+        plot_dir = os.path.join(cfg.io.output_dir, "type1")
+
+    output_dir = os.path.join(plot_dir, str(fill))
+    os.makedirs(output_dir, exist_ok=True)
+    
+    png_path = os.path.join(output_dir, f"laser_evolution.png")
+    plt.savefig(png_path, dpi=500)
+    plt.close(fig)
+
+    # Laser vs SBIL
+    fig, ax = create_double_figure('SBIL [Hz/µb]', 'Uncorr. laser bins', 'Corr. laser bins', fill, ratio=1)
+
+    for bcid in laser_bcid:
+        ax[0].plot(avg_origin, hists_origin[:, bcid], '.', label=f'LASER BCID {bcid}')
+        ax[1].plot(avg,        hists[:, bcid],        '.', label=f'LASER BCID {bcid}')
+
+    ax[0].legend(loc='upper right', frameon=False, fontsize=12)
+    ax[1].legend(loc='upper right', frameon=False, fontsize=12)
+
+    png_path = os.path.join(output_dir, f"laser_sbil.png")
+    plt.savefig(png_path, dpi=500)
+    plt.close(fig)
+
+    # TODO find beam information
+    # Bunch intensities + luminosities
+    """
+    fig, ax = create_double_figure('Fill duration [s]', 'Beam intensity [N protons]', 'Instantenious luminosity [Hz/µb]', fill)
+
+    ax[0].plot(index, intensity1, '.', label='B1 Intensity')
+    ax[0].plot(index, intensity2, '.', label='B2 Intensity')
+
+    ax[1].plot(index, avg_origin, '.', label='Origin')
+    ax[1].plot(index, avg, '.', label='With corrections')
+
+    ax[0].legend(loc='upper right', frameon=False, fontsize=12)
+    ax[1].legend(loc='upper right', frameon=False, fontsize=12)
+    plt.tight_layout()
+
+    png_path = os.path.join(output_dir, f"beam_intensity.png")
+    plt.savefig(png_path, dpi=500)
+    plt.close(fig)
+    """
+
