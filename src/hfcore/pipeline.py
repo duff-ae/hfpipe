@@ -7,6 +7,7 @@ import numpy as np
 import logging
 import h5py
 import re
+import copy
 
 from .decorators import log_step, timeit
 from .io import load_hd5_to_arrays, arrays_to_rows, save_to_hd5
@@ -15,6 +16,7 @@ from .afterglow_lsq import build_afterglow_solver_from_file
 from .type1_fit import compute_type1_coeffs, save_type1_coeffs, analyze_type1_step
 from .type1_apply import apply_type1_batch
 from .online_recovery import reconstruct_from_tables_batch, reconstruct_from_online_batch, compare_recovery_methods
+from .plotter import plot_hist_bx, plot_lumi_comparison, plot_residuals, plot_lasers
 
 from .config import PipelineConfig
 
@@ -570,6 +572,9 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
 
     # --- 1) load input data (may contain multiple files and multiple fills) ---
     data = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.io.node)
+    
+    # TODO beam table is missing from fill???
+    #beam = load_hd5_to_arrays(cfg.io.beam_dir, input_name, node='beam')
 
     # --- 1a) keep only rows corresponding to the current fill ---
     fill_arr = data.get("fillnum", None)
@@ -616,6 +621,15 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
             fill,
         )
 
+    # plot the uncorrected rates
+    # TODO likely will want to use a different flag
+    # TODO also need to tell the plot which year this is
+    if cfg.type1.make_plots:
+        plot_hist_bx(data, cfg, fill, 'Uncorr. Luminosity')
+
+        # save the uncorrected rates for later comparison
+        data_origin = copy.deepcopy(data)
+
     # --- 2) pipeline steps ---
     if cfg.steps.online_recovery:
         data = recover_bxraw_step(
@@ -629,11 +643,25 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
     if cfg.steps.restore_rates:
         data = restore_rates_step(data, cfg, active_mask)
 
+    # plot after t2 but before t1
+    if cfg.type1.make_plots:
+        plot_hist_bx(data, cfg, fill, 'T2 Corr. Luminosity')
+        plot_residuals(data, cfg, active_mask, fill, 't2_corr')
+    
     if cfg.steps.compute_type1:
         data = compute_type1_step(data, cfg, active_mask, fill)
 
     if cfg.steps.apply_type1:
         data = apply_type1_step(data, cfg, active_mask, fill)
+
+    # plot the corrected rates
+    # TODO likely will want to use a different flag
+    # TODO also need to tell the plot which year this is
+    if cfg.type1.make_plots:
+        plot_hist_bx(data, cfg, fill, 'T2 and T1 Corr. Luminosity')
+        plot_lumi_comparison(data, data_origin, cfg, active_mask, fill)
+        plot_residuals(data, cfg, active_mask, fill, 'full_corr')
+        plot_lasers(data, data_origin, cfg, active_mask, fill)
 
     # --- 3) save result ---
     rows = arrays_to_rows(data)

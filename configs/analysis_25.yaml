@@ -2,11 +2,12 @@ io:
   # Input HFET hd5 files, one file per fill
   # Expected path: /cephfs/brilshare/alshevel/hf_origin/hfet/25/<fill>/<fill>_*.hd5
   input_dir: "/cephfs/brilshare/alshevel/hf_origin/hfet/25"
+  beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
   input_pattern: "{fill}/{fill}_*.hd5"
 
   # Output files, to avoid overwriting the old version
   # Resulting path: /cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_test/<fill>/<fill>.hd5
-  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_test"
+  output_dir: "/eos/user/l/leeja/HF/data_hfpipe"
   output_pattern: "{fill}/{fill}.hd5"
 
   # HDF5 node / key with the HFET table
@@ -17,7 +18,7 @@ io:
   active_mask_pattern: "/cephfs/brilshare/alshevel/hf_masks/activeBXMask_fill{fill}.npy"
 
   # Directory where Type-1 diagnostic plots (etc.) are stored
-  type1_dir: "/eos/home-a/alshevel/hf_type_plots"
+  type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe"
 
 steps:
   restore_rates: true
@@ -51,7 +52,7 @@ afterglow:
 
 type1:
   # Offsets (in BX) between the main bunch and the tail to be fitted
-  offsets: [1, 2, 3, 4]
+  offsets: [3, 4]
 
   # Minimum SBIL for including a point in the Type-1 fit
   sbil_min: 0.1
