@@ -6,6 +6,7 @@ from typing import List
 import numpy as np
 import logging
 import h5py
+import re
 
 from .decorators import log_step, timeit
 from .io import load_hd5_to_arrays, arrays_to_rows, save_to_hd5
@@ -13,12 +14,70 @@ from .hd5schema import BX_LEN
 from .afterglow_lsq import build_afterglow_solver_from_file
 from .type1_fit import compute_type1_coeffs, save_type1_coeffs, analyze_type1_step
 from .type1_apply import apply_type1_batch
+from .online_recovery import reconstruct_from_tables_batch, reconstruct_from_online_batch, compare_recovery_methods
 
 from .config import PipelineConfig
 
 
 log = logging.getLogger("hfpipe")
 
+
+def _align_aux_by_keys(
+    main: Dict[str, np.ndarray],
+    aux: Dict[str, np.ndarray],
+    colname: str,
+) -> np.ndarray:
+    """
+    Выровнять дополнительный HD5-узел (aux) под основной (main)
+    по ключам (fillnum, runnum, lsnum, nbnum).
+
+    main  — это уже отфильтрованный по fill словарь data (hfetlumi):
+            main["fillnum"], main["runnum"], main["lsnum"], main["nbnum"], main["bxraw"], ...
+
+    aux   — это словарь из load_hd5_to_arrays для hfEtPedestal или hfafterglowfrac,
+            где "bxraw" содержит сами данные (4 значения педестала или 3564 afterglow).
+
+    colname — имя колонки в aux, которую хотим выровнять (у нас это всегда "bxraw").
+
+    Возвращает массив shape (T, ...) в том же порядке, что main.
+    """
+    keys = ("fillnum", "runnum", "lsnum", "nbnum")
+
+    # --- основные ключи (уже отфильтрованные по fill) ---
+    T = main[keys[0]].shape[0]
+    main_key = np.stack([main[k].astype(np.int64) for k in keys], axis=1)  # (T, 4)
+
+    # --- ключи в aux ---
+    aux_T = aux[keys[0]].shape[0]
+    aux_key = np.stack([aux[k].astype(np.int64) for k in keys], axis=1)    # (aux_T, 4)
+
+    # строим index: (fill,run,ls,nb) -> idx
+    index: Dict[tuple, int] = {}
+    for j in range(aux_T):
+        index[tuple(aux_key[j])] = j
+
+    aux_col = aux[colname]
+    # форма одной строки
+    tail_shape = aux_col.shape[1:]  # () или (4,) или (BX_LEN,)
+
+    out = np.zeros((T,) + tail_shape, dtype=aux_col.dtype)
+
+    missing = 0
+    for i in range(T):
+        key = tuple(main_key[i])
+        j = index.get(key, None)
+        if j is None:
+            missing += 1
+            # можно оставить нули или кинуть исключение —
+            # пока просто оставим нули и продолжим
+            continue
+        out[i] = aux_col[j]
+
+    if missing > 0:
+        # если хочется, можно ужесточить до raise
+        print(f"[WARN] _align_aux_by_keys: {missing} rows had no match in aux node")
+
+    return out
 
 # ---------------------------------------------------------------------------
 # Helpers for Type-1 paths
@@ -48,6 +107,163 @@ def _get_type1_coeff_path(cfg: PipelineConfig, fill: int) -> str:
     type1_dir = _get_type1_dir(cfg)
     return os.path.join(type1_dir, f"type1_coeffs_fill{fill}.h5")
 
+# ---------------------------------------------------------------------------
+# Step 0: recover origin rates
+# ---------------------------------------------------------------------------
+def _load_hfsbr_for_online(cfg: PipelineConfig, fill: int) -> np.ndarray:
+    pattern = cfg.online_recovery.hfsbr_pattern or cfg.afterglow.hfsbr_pattern
+    if not pattern:
+        raise ValueError(
+            "No HFSBR pattern for online recovery "
+            "(both online_recovery.hfsbr_pattern and afterglow.hfsbr_pattern are empty)."
+        )
+
+    path = pattern.format(fill=fill)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"HFSBR file for online recovery not found: {path}")
+
+    # 1) .npy
+    if path.endswith(".npy"):
+        arr = np.load(path)
+        return np.asarray(arr, dtype=np.float64).ravel()
+
+    # 2) .txt / .dat: произвольный список чисел с запятыми/пробелами
+    if path.endswith(".txt") or path.endswith(".dat"):
+        with open(path, "r") as f:
+            text = f.read()
+
+        # убираем скобки, если вдруг массив записан как [1.0, 0.9, ...]
+        text = text.replace("[", " ").replace("]", " ")
+
+        # разбиваем по запятым и пробелам/переводам строк
+        tokens = re.split(r"[,\s]+", text)
+
+        values = []
+        for tok in tokens:
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                values.append(float(tok))
+            except ValueError:
+                # можно залогировать, но не падать из-за мусора
+                # print(f"[WARN] skip token in HFSBR file: {tok!r}")
+                continue
+
+        if not values:
+            raise RuntimeError(f"HFSBR .txt file {path} did not contain any numeric tokens")
+
+        arr = np.asarray(values, dtype=np.float64).ravel()
+
+        if arr.shape[0] < BX_LEN:
+            raise RuntimeError(
+                f"HFSBR from {path} has length {arr.shape[0]} < BX_LEN={BX_LEN}"
+            )
+
+        return arr
+
+    # 3) .h5 / .hd5
+    if path.endswith(".h5") or path.endswith(".hd5"):
+        with h5py.File(path, "r") as h5:
+            if "hfsbr" in h5:
+                return np.asarray(h5["hfsbr"][:], dtype=np.float64).ravel()
+            for name, obj in h5.items():
+                if hasattr(obj, "shape"):
+                    return np.asarray(obj[...], dtype=np.float64).ravel()
+        raise RuntimeError(f"Could not find HFSBR dataset in {path}")
+
+    # 4) остальное — ругаемся
+    raise RuntimeError(
+        f"Unknown HFSBR file format for path {path}. "
+        f"Please adapt _load_hfsbr_for_online."
+    )
+
+def recover_bxraw_step(
+    data: dict,
+    cfg: PipelineConfig,
+    active_mask: np.ndarray,
+    fill: int,
+    input_pattern: str,
+) -> dict:
+    bxraw_final = np.asarray(data["bxraw"], dtype=np.float32)
+    rec_cfg = cfg.online_recovery
+
+    use_tables = (rec_cfg.method == "tables")
+    use_online = (rec_cfg.method == "online")
+    do_debug = bool(rec_cfg.debug_compare)
+
+    states_tables = None
+    states_online = None
+
+    # --- Method A: через hfEtPedestal + hfafterglowfrac ---
+    if use_tables or do_debug:
+        ped_node = rec_cfg.pedestal_node
+        aft_node = rec_cfg.afterglow_node
+
+        ped_data = load_hd5_to_arrays(
+            cfg.io.input_dir,
+            input_pattern,
+            node=ped_node,
+        )
+        aft_data = load_hd5_to_arrays(
+            cfg.io.input_dir,
+            input_pattern,
+            node=aft_node,
+        )
+
+        # ВАЖНО: ped_data и aft_data мы выравниваем по тем же ключам,
+        # что и основной hfetlumi (data), который уже отфильтрован по fill.
+        ped_4 = _align_aux_by_keys(
+            main=data,
+            aux=ped_data,
+            colname="bxraw",   # в aux "bxraw" = 4 значения ped
+        ).astype(np.float32)
+
+        aft_frac = _align_aux_by_keys(
+            main=data,
+            aux=aft_data,
+            colname="bxraw",   # в aux "bxraw" = 3564 afterglow frac
+        ).astype(np.float32)
+
+        states_tables = reconstruct_from_tables_batch(
+            bxraw_final=bxraw_final,
+            pedestal_4=ped_4,
+            afterglow_frac=aft_frac,
+        )
+
+    # --- Method B: онлайн-инверсия ---
+    if use_online or do_debug:
+        hfsbr = _load_hfsbr_for_online(cfg, fill)
+        states_online = reconstruct_from_online_batch(
+            bxraw_final=bxraw_final,
+            hfsbr=hfsbr,
+            active_mask=active_mask,
+            zero_bx=(3553, 3554, 3555, 3556, 3557),
+        )
+
+    # --- Что дальше считаем "bxraw" ---
+    if use_tables:
+        data["bxraw"] = states_tables.mu_before
+    else:
+        if states_online is None:
+            raise RuntimeError("online_recovery: states_online is None, check config")
+        data["bxraw"] = states_online.mu_before
+
+    # --- Debug-сравнение методов ---
+    if do_debug and (states_tables is not None) and (states_online is not None):
+        debug = compare_recovery_methods(states_tables, states_online)
+        pull_before = debug["pull_mu_before"].ravel()
+        mean_pull = float(np.nanmean(pull_before))
+        std_pull = float(np.nanstd(pull_before))
+
+        log.info(
+            "[online_recovery] fill %d: pull(mu_before) mean=%.3f std=%.3f",
+            fill,
+            mean_pull,
+            std_pull,
+        )
+
+    return data
 
 # ---------------------------------------------------------------------------
 # Step 1: afterglow / recovery of mu_true
@@ -401,6 +617,15 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
         )
 
     # --- 2) pipeline steps ---
+    if cfg.steps.online_recovery:
+        data = recover_bxraw_step(
+            data=data,
+            cfg=cfg,
+            active_mask=active_mask,
+            fill=fill,
+            input_pattern=input_name,
+        )
+
     if cfg.steps.restore_rates:
         data = restore_rates_step(data, cfg, active_mask)
 

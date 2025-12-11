@@ -1,10 +1,12 @@
 io:
-  # Input hd5 files, one file per fill
-  input_dir: "/cephfs/brilshare/alshevel/hf_origin/hfet/24"
+  # Input HFET hd5 files, one file per fill
+  # Expected path: /cephfs/brilshare/alshevel/hf_origin/hfet/25/<fill>/<fill>_*.hd5
+  input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics/"
   input_pattern: "{fill}/{fill}_*.hd5"
 
   # Output files, to avoid overwriting the old version
-  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/24"
+  # Resulting path: /cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_test/<fill>/<fill>.hd5
+  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_test"
   output_pattern: "{fill}/{fill}.hd5"
 
   # HDF5 node / key with the HFET table
@@ -18,9 +20,19 @@ io:
   type1_dir: "/eos/home-a/alshevel/hf_type_plots"
 
 steps:
-  restore_rates: true
-  compute_type1: true
+  online_recovery: true
+  restore_rates: false
+  compute_type1: false
   apply_type1: false
+
+online_recovery:
+  method: "online"       # "online" или "tables"
+  debug_compare: true   # если true и есть таблицы — посчитаем оба метода и сравним
+
+  pedestal_node: "hfEtPedestal"
+  afterglow_node: "hfafterglowfrac"
+
+  hfsbr_pattern: "/eos/home-a/alshevel/hfpipe/input/afterglow/hfet_online_25.txt"
 
 afterglow:
 
@@ -31,8 +43,9 @@ afterglow:
   # Regularization strengths for the LSQ inversion
   lambda_reg: 0.01
   lambda_nonactive: 0.05
-  # Number of cores
+  
   n_jobs: 16
+
   # From your note: sigvis = 3170.19
   # Conversion example: bx = bxraw * 11245.6 / sigvis
   sigvis: 3170.19
@@ -40,14 +53,16 @@ afterglow:
 type1:
   # Offsets (in BX) between the main bunch and the tail to be fitted
   offsets: [1, 2, 3, 4]
+
   # Minimum SBIL for including a point in the Type-1 fit
   sbil_min: 0.1
+
   # Whether to produce Type-1 summary plots
   make_plots: true
-  # draw "before" Type-1 plots directly in compute_type1_step
-  debug: true
-  # draw "after" Type-1 plots in apply_type1_step
-  debug_after_apply: true
+
+  debug: true             # draw "before" Type-1 plots directly in compute_type1_step
+  debug_after_apply: true # draw "after" Type-1 plots in apply_type1_step
+
   # Do not store heavy intermediate type1_{offset}.h5 files
   save_hd5: false
 

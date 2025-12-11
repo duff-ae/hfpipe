@@ -8,7 +8,22 @@ import yaml
 
 
 @dataclass
+class OnlineRecoveryConfig:
+    method: str = "online"          # "online" or "tables"
+    debug_compare: bool = False
+
+    pedestal_node: str = "hfEtPedestal"
+    afterglow_node: str = "hfafterglowfrac"
+
+    # HFSBR для инверсии онлайн-алгоритма.
+    # Если None -> fallback на afterglow.hfsbr_pattern
+    hfsbr_pattern: str | None = None
+
+@dataclass
 class StepsConfig:
+
+    online_recovery: bool = False
+
     # 1) восстановление истинных bxraw (afterglow LSQ)
     restore_rates: bool = False
 
@@ -43,7 +58,6 @@ class AfterglowConfig:
     sigvis: Optional[float] = None
 
 
-
 @dataclass
 class Type1Config:
     # Порог по SBIL (avg/sbil) для отбора точек
@@ -67,6 +81,7 @@ class Type1Config:
 class PipelineConfig:
     io: IOConfig
     steps: StepsConfig
+    online_recovery: OnlineRecoveryConfig
     afterglow: AfterglowConfig
     type1: Type1Config
     fills: List[int]
@@ -78,6 +93,7 @@ def load_config(path: str) -> PipelineConfig:
 
     io = IOConfig(**cfg_dict["io"])
     steps = StepsConfig(**cfg_dict.get("steps", {}))
+    online_recovery = OnlineRecoveryConfig(**cfg_dict.get("online_recovery", {}))
     afterglow = AfterglowConfig(**cfg_dict.get("afterglow", {}))
     type1 = Type1Config(**cfg_dict.get("type1", {}))
     fills = cfg_dict.get("fills", [])
@@ -85,6 +101,7 @@ def load_config(path: str) -> PipelineConfig:
     return PipelineConfig(
         io=io,
         steps=steps,
+        online_recovery=online_recovery,
         afterglow=afterglow,
         type1=type1,
         fills=fills,

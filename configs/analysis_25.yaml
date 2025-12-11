@@ -21,8 +21,16 @@ io:
 
 steps:
   restore_rates: true
-  compute_type1: true
-  apply_type1: true
+  compute_type1: false
+  apply_type1: false
+
+online_recovery:
+  enabled: true          # включить/выключить шаг восстановления bxraw
+  method: "online"       # "online" или "tables"
+  debug_compare: false   # если true и есть таблицы — посчитаем оба метода и сравним
+
+  pedestal_node: "hfEtPedestal"
+  afterglow_node: "hfafterglowfrac"
 
 afterglow:
 
@@ -30,6 +38,7 @@ afterglow:
   bx_to_clean: [3488, 3489, 3490, 3491, 3553, 3554, 3555, 3556, 3557]
   
   hfsbr_pattern: "/eos/home-a/alshevel/hfpipe/input/afterglow/hfet_lsq_test.txt"
+  hfsbr_online_pattern: "/eos/home-a/alshevel/hfpipe/input/afterglow/hfet_lsq_test.txt"
   # Regularization strengths for the LSQ inversion
   lambda_reg: 0.01
   lambda_nonactive: 0.05
