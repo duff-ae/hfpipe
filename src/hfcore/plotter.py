@@ -70,9 +70,9 @@ def plot_hist_bx(data, cfg, fill, label):
     plt.tight_layout()
 
     if 'Corr. Luminosity' in label:
-        ax[1].set_ylim(-0.5, 0.5)
+        ax[1].set_ylim(-0.01, 0.01)
     else:
-        ax[1].set_ylim(-0.5, 2)
+        ax[1].set_ylim(-0.004, 0.004)
     
     #ax[1].set_xlim(0, 500) # TODO remove
 

@@ -2,6 +2,7 @@ io:
   # Input HFET hd5 files, one file per fill
   # Expected path: /cephfs/brilshare/alshevel/hf_origin/hfet/25/<fill>/<fill>_*.hd5
   input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics/"
+  beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
   input_pattern: "{fill}/{fill}_*.hd5"
 
   # Output files, to avoid overwriting the old version
