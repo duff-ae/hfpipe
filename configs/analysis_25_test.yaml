@@ -28,7 +28,7 @@ steps:
 
 online_recovery:
   method: "online"       # "online" или "tables"
-  debug_compare: true   # если true и есть таблицы — посчитаем оба метода и сравним
+  debug_compare: false   # will be 
 
   pedestal_node: "hfEtPedestal"
   afterglow_node: "hfafterglowfrac"
