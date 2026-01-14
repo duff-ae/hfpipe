@@ -74,7 +74,7 @@ def plot_hist_bx(data, cfg, fill, label):
     else:
         ax[1].set_ylim(-0.5, 2)
     
-    #ax[1].set_xlim(0, 500) # TODO remove
+    ax[1].set_xlim(0, 500) # TODO remove
 
     # TODO this should be changed to a dedicated plotting directory
     plot_dir = getattr(cfg.io, "type1_dir", None)
@@ -140,7 +140,7 @@ def plot_residuals(data, cfg, active_mask, fill, label):
     bxp2_idx    = np.roll(bxp1_idx, 1)
     # the +2 is IMPORTANT because of how numpy.invert works
     bxt2_idx    = ((~active_mask + 2) & (~bxp1_idx + 2) & (~bxp2_idx + 2))
-    bxt2_idx[np.asarray(cfg.afterglow.bx_to_clean, dtype=np.int64)] = False 
+    bxt2_idx[np.asarray(cfg.afterglow.bx_to_clean, dtype=np.int64)] = 0
 
     # calculate the residuals
     avg_t1p1 = np.array([np.multiply(hist, bxp1_idx).mean() for hist in hists])
