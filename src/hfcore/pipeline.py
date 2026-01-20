@@ -29,38 +29,21 @@ def _align_aux_by_keys(
     aux: Dict[str, np.ndarray],
     colname: str,
 ) -> np.ndarray:
-    """
-    Выровнять дополнительный HD5-узел (aux) под основной (main)
-    по ключам (fillnum, runnum, lsnum, nbnum).
 
-    main  — это уже отфильтрованный по fill словарь data (hfetlumi):
-            main["fillnum"], main["runnum"], main["lsnum"], main["nbnum"], main["bxraw"], ...
-
-    aux   — это словарь из load_hd5_to_arrays для hfEtPedestal или hfafterglowfrac,
-            где "bxraw" содержит сами данные (4 значения педестала или 3564 afterglow).
-
-    colname — имя колонки в aux, которую хотим выровнять (у нас это всегда "bxraw").
-
-    Возвращает массив shape (T, ...) в том же порядке, что main.
-    """
     keys = ("fillnum", "runnum", "lsnum", "nbnum")
 
-    # --- основные ключи (уже отфильтрованные по fill) ---
     T = main[keys[0]].shape[0]
     main_key = np.stack([main[k].astype(np.int64) for k in keys], axis=1)  # (T, 4)
 
-    # --- ключи в aux ---
     aux_T = aux[keys[0]].shape[0]
     aux_key = np.stack([aux[k].astype(np.int64) for k in keys], axis=1)    # (aux_T, 4)
 
-    # строим index: (fill,run,ls,nb) -> idx
     index: Dict[tuple, int] = {}
     for j in range(aux_T):
         index[tuple(aux_key[j])] = j
 
     aux_col = aux[colname]
-    # форма одной строки
-    tail_shape = aux_col.shape[1:]  # () или (4,) или (BX_LEN,)
+    tail_shape = aux_col.shape[1:]
 
     out = np.zeros((T,) + tail_shape, dtype=aux_col.dtype)
 
@@ -70,13 +53,10 @@ def _align_aux_by_keys(
         j = index.get(key, None)
         if j is None:
             missing += 1
-            # можно оставить нули или кинуть исключение —
-            # пока просто оставим нули и продолжим
             continue
         out[i] = aux_col[j]
 
     if missing > 0:
-        # если хочется, можно ужесточить до raise
         print(f"[WARN] _align_aux_by_keys: {missing} rows had no match in aux node")
 
     return out
@@ -129,15 +109,13 @@ def _load_hfsbr_for_online(cfg: PipelineConfig, fill: int) -> np.ndarray:
         arr = np.load(path)
         return np.asarray(arr, dtype=np.float64).ravel()
 
-    # 2) .txt / .dat: произвольный список чисел с запятыми/пробелами
+    # 2) .txt / .dat
     if path.endswith(".txt") or path.endswith(".dat"):
         with open(path, "r") as f:
             text = f.read()
 
-        # убираем скобки, если вдруг массив записан как [1.0, 0.9, ...]
         text = text.replace("[", " ").replace("]", " ")
 
-        # разбиваем по запятым и пробелам/переводам строк
         tokens = re.split(r"[,\s]+", text)
 
         values = []
@@ -148,8 +126,6 @@ def _load_hfsbr_for_online(cfg: PipelineConfig, fill: int) -> np.ndarray:
             try:
                 values.append(float(tok))
             except ValueError:
-                # можно залогировать, но не падать из-за мусора
-                # print(f"[WARN] skip token in HFSBR file: {tok!r}")
                 continue
 
         if not values:
@@ -174,7 +150,6 @@ def _load_hfsbr_for_online(cfg: PipelineConfig, fill: int) -> np.ndarray:
                     return np.asarray(obj[...], dtype=np.float64).ravel()
         raise RuntimeError(f"Could not find HFSBR dataset in {path}")
 
-    # 4) остальное — ругаемся
     raise RuntimeError(
         f"Unknown HFSBR file format for path {path}. "
         f"Please adapt _load_hfsbr_for_online."
@@ -197,7 +172,6 @@ def recover_bxraw_step(
     states_tables = None
     states_online = None
 
-    # --- Method A: через hfEtPedestal + hfafterglowfrac ---
     if use_tables or do_debug:
         ped_node = rec_cfg.pedestal_node
         aft_node = rec_cfg.afterglow_node
@@ -213,18 +187,16 @@ def recover_bxraw_step(
             node=aft_node,
         )
 
-        # ВАЖНО: ped_data и aft_data мы выравниваем по тем же ключам,
-        # что и основной hfetlumi (data), который уже отфильтрован по fill.
         ped_4 = _align_aux_by_keys(
             main=data,
             aux=ped_data,
-            colname="bxraw",   # в aux "bxraw" = 4 значения ped
+            colname="bxraw",
         ).astype(np.float32)
 
         aft_frac = _align_aux_by_keys(
             main=data,
             aux=aft_data,
-            colname="bxraw",   # в aux "bxraw" = 3564 afterglow frac
+            colname="bxraw",
         ).astype(np.float32)
 
         states_tables = reconstruct_from_tables_batch(
@@ -233,7 +205,6 @@ def recover_bxraw_step(
             afterglow_frac=aft_frac,
         )
 
-    # --- Method B: онлайн-инверсия ---
     if use_online or do_debug:
         hfsbr = _load_hfsbr_for_online(cfg, fill)
         states_online = reconstruct_from_online_batch(
@@ -243,7 +214,6 @@ def recover_bxraw_step(
             zero_bx=(3553, 3554, 3555, 3556, 3557),
         )
 
-    # --- Что дальше считаем "bxraw" ---
     if use_tables:
         data["bxraw"] = states_tables.mu_before
     else:
@@ -251,7 +221,6 @@ def recover_bxraw_step(
             raise RuntimeError("online_recovery: states_online is None, check config")
         data["bxraw"] = states_online.mu_before
 
-    # --- Debug-сравнение методов ---
     if do_debug and (states_tables is not None) and (states_online is not None):
         debug = compare_recovery_methods(states_tables, states_online)
         pull_before = debug["pull_mu_before"].ravel()
