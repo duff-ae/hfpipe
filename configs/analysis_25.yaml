@@ -53,7 +53,7 @@ afterglow:
 
 type1:
   # Offsets (in BX) between the main bunch and the tail to be fitted
-  offsets: [3, 4]
+  offsets: [1, 2, 3, 4]
 
   # Minimum SBIL for including a point in the Type-1 fit
   sbil_min: 0.1

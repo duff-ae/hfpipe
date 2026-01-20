@@ -135,19 +135,6 @@ def _fit_type1_for_offset(
     coeffs = np.polyfit(y_all, frac_all, order)
     coeffs = coeffs[::-1]  # now coeffs[0] = c_0, coeffs[1] = c_1, ...
 
-    # linear case: frac ≈ k * y + b
-    if order == 1:
-        b = float(coeffs[0])
-        k = float(coeffs[1]) if coeffs.size > 1 else 0.0
-        return b, k, 0.0
-
-    # quadratic case: frac ≈ k2 * y^2 + k1 * y + b
-    if order == 2:
-        b = float(coeffs[0])
-        k1 = float(coeffs[1]) if coeffs.size > 1 else 0.0
-        k2 = float(coeffs[2]) if coeffs.size > 2 else 0.0
-        return b, k1, k2
-
     # fallback (should not be used in practice)
     p0 = float(coeffs[0]) if coeffs.size > 0 else 0.0
     p1 = float(coeffs[1]) if coeffs.size > 1 else 0.0
@@ -176,7 +163,7 @@ def compute_type1_coeffs(
       index t corresponds to BX + t, i.e. t=1 -> BX+1, etc.
       t=0 is kept zero (no subtraction for the colliding BX itself).
     """
-    bxraw = np.asarray(bxraw, dtype=np.float64)
+    bxraw = np.array(bxraw, dtype=np.float64)
     avg = np.asarray(avg, dtype=np.float64)
     active_mask = np.asarray(active_mask, dtype=np.int32)
 
@@ -192,7 +179,7 @@ def compute_type1_coeffs(
     p2 = np.zeros(max_offset + 1, dtype=np.float64)
     orders = np.zeros(max_offset + 1, dtype=np.int32)
 
-    for off in offsets:
+    for off in reversed(offsets):
         if off <= 0:
             continue  # offset = 0 is not used
 
@@ -214,6 +201,13 @@ def compute_type1_coeffs(
         p1[off] = c1
         p2[off] = c2
         orders[off] = order
+
+        # TODO apply corrections in reverse?
+        for ibx in range(0, BX_LEN - off):
+            if active_mask[ibx] != 1:
+                continue
+            y = bxraw[:, ibx]
+            bxraw[:, ibx + off] -= y * (c0 + c1*y + c2*y**2)
 
     return p0, p1, p2, orders
 
