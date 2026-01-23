@@ -35,7 +35,9 @@ afterglow:
   # for restoring rates from online
   online_hfsbr: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Apr24_24.txt"
   
-  hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfoc_10843.txt"
+  #hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfoc_10843.txt"
+  hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Apr24_24.txt"
+  
   # Regularization strengths for the LSQ inversion
   lambda_reg: 0.01
   lambda_nonactive: 0.05
