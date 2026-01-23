@@ -7,6 +7,9 @@ import numpy as np
 import logging
 import h5py
 import copy
+import math
+from tqdm import tqdm
+from joblib import Parallel, delayed
 
 from .decorators import log_step, timeit
 from .io import load_hd5_to_arrays, arrays_to_rows, save_to_hd5
@@ -50,6 +53,87 @@ def _get_type1_coeff_path(cfg: PipelineConfig, fill: int) -> str:
     type1_dir = _get_type1_dir(cfg)
     return os.path.join(type1_dir, f"type1_coeffs_fill{fill}.h5")
 
+
+# ---------------------------------------------------------------------------
+# Step 0: revert the online corrections
+# ---------------------------------------------------------------------------
+def revert_afterglow_batch(mu_batch, HFSBR, active_mask):
+    """
+    Revert afterglow for a batch of time slices.
+    mu_batch: shape (batch_size, N)
+    """
+    mu = mu_batch.copy()
+    B, N = mu.shape
+    
+    for ibx in range(N - 1, -1, -1):
+        if not active_mask[ibx]:
+            continue
+
+        base = mu[:, ibx][:, None]  # shape (B, 1)
+
+        # No wrap: j = ibx+1 .. N-1
+        if ibx + 1 < N:
+            mu[:, ibx + 1:N] += base * HFSBR[1:N - ibx][None, :]
+
+        # Wrap: j = 0 .. ibx-1
+        if ibx > 0:
+            mu[:, 0:ibx] += base * HFSBR[N - ibx:N][None, :]
+
+    return mu
+
+@log_step("revert_online")
+@timeit("revert_online")
+def revert_online_corrections(data: dict, cfg: PipelineConfig, active_mask: np.ndarray) -> dict:
+    fills = np.unique(data["fillnum"])
+    if fills.size != 1:
+        raise ValueError(f"Expected exactly one fill in file, got {fills}")
+    fill = int(fills[0])
+    
+    # --- load HFSBR matrix ---
+    hfsbr_path = cfg.afterglow.online_hfsbr.format(fill=fill)
+    if not os.path.exists(hfsbr_path):
+        raise FileNotFoundError(f"HFSBR file not found: {hfsbr_path}")
+
+    HFSBR = np.loadtxt(hfsbr_path, dtype=np.float64, delimiter=",")
+    HFSBR = HFSBR.astype(np.float64, copy=False)
+    N     = HFSBR.shape[0]
+
+    if N != BX_LEN:
+        raise ValueError(f"HFSBR len={N} does not match BX_LEN={BX_LEN}")
+
+    active_mask = np.asarray(active_mask, dtype=np.int32)
+    if active_mask.shape[0] != N:
+        raise ValueError("active_mask must match HFSBR length")
+    
+    bxraw_obs = data["bxraw"]
+    assert bxraw_obs.shape[1] == BX_LEN
+
+    # Split T into batches
+    n_jobs = cfg.afterglow.n_jobs
+    T = bxraw_obs.shape[0]
+    batch_size = min(T, max(10, math.ceil(T / (2 * n_jobs))))
+    batches = [bxraw_obs[i : i + batch_size] for i in range(0, bxraw_obs.shape[0], batch_size)]
+
+    # Parallel processing
+    results = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(revert_afterglow_batch)(batch, HFSBR, active_mask)
+        for batch in tqdm(batches, desc="Reverting Online Afterglow", unit="batch")
+    )
+
+    # Stack results back
+    data["bxraw"] = np.vstack(results)
+
+    # ------------------------------------------------------------------
+    # Recompute bx and avg
+    # ------------------------------------------------------------------
+    sigvis = cfg.afterglow.sigvis
+    scale = 1.0 if not sigvis else 11245.6 / float(sigvis)
+
+    bx_lumi = (data["bxraw"] * scale).astype(np.float32, copy=False)
+    data["bx"] = bx_lumi
+    data["avg"] = bx_lumi.mean(axis=1).astype(np.float32)
+
+    return data
 
 # ---------------------------------------------------------------------------
 # Step 1: afterglow / recovery of mu_true
@@ -357,9 +441,6 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
     # --- 1) load input data (may contain multiple files and multiple fills) ---
     data = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.io.node)
     
-    # TODO beam table is missing from fill???
-    #beam = load_hd5_to_arrays(cfg.io.beam_dir, input_name, node='beam')
-
     # --- 1a) keep only rows corresponding to the current fill ---
     fill_arr = data.get("fillnum", None)
     if fill_arr is not None:
@@ -405,6 +486,10 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
             fill,
         )
 
+    # before doing any processing, revert the online corrections
+    if cfg.steps.revert_online:
+        data = revert_online_corrections(data, cfg, active_mask)
+
     # plot the uncorrected rates
     # TODO likely will want to use a different flag
     # TODO also need to tell the plot which year this is
@@ -415,6 +500,7 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
         data_origin = copy.deepcopy(data)
 
     # --- 2) pipeline steps ---
+
     if cfg.steps.restore_rates:
         data = restore_rates_step(data, cfg, active_mask)
 

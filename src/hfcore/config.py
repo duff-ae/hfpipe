@@ -9,6 +9,9 @@ import yaml
 
 @dataclass
 class StepsConfig:
+    # 0) revert online Type2 correctios
+    revert_online: bool = False
+
     # 1) восстановление истинных bxraw (afterglow LSQ)
     restore_rates: bool = False
 
@@ -39,6 +42,7 @@ class AfterglowConfig:
     lambda_reg: float = 0.01
     lambda_nonactive: float = 0.05
     bx_to_clean: Optional[List[int]] = None
+    online_hfsbr: Optional[str] = None
     hfsbr_pattern: Optional[str] = None
     n_jobs: int = -1
     sigvis: Optional[float] = None

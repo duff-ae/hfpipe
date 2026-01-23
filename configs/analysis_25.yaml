@@ -1,7 +1,8 @@
 io:
   # Input HFET hd5 files, one file per fill
   # Expected path: /cephfs/brilshare/alshevel/hf_origin/hfet/25/<fill>/<fill>_*.hd5
-  input_dir: "/cephfs/brilshare/alshevel/hf_origin/hfet/25"
+  #input_dir: "/cephfs/brilshare/alshevel/hf_origin/hfet/25"
+  input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
   beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
   input_pattern: "{fill}/{fill}_*.hd5"
 
@@ -10,8 +11,8 @@ io:
   output_dir: "/eos/user/l/leeja/HF/data_hfpipe"
   output_pattern: "{fill}/{fill}.hd5"
 
-  # HDF5 node / key with the HFET table
-  node: "hfetlumi"
+  # HDF5 node / key with the HF table
+  node: "hfoclumi"
 
   # Precomputed active BX mask (shape=(3564,), dtype=int)
   # Can be produced once from the beam hd5
@@ -21,6 +22,7 @@ io:
   type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe"
 
 steps:
+  revert_online: true
   restore_rates: true
   compute_type1: true
   apply_type1:   true
@@ -30,7 +32,10 @@ afterglow:
   # BX indices to hard-clean (mu_true = 0) – analogue of BX_TO_CLEAN
   bx_to_clean: [3488, 3489, 3490, 3491, 3553, 3554, 3555, 3556, 3557]
   
-  hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfet_lsq_test.txt"
+  # for restoring rates from online
+  online_hfsbr: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Apr24_24.txt"
+  
+  hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfoc_10843.txt"
   # Regularization strengths for the LSQ inversion
   lambda_reg: 0.01
   lambda_nonactive: 0.05

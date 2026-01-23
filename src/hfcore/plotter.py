@@ -138,13 +138,13 @@ def plot_residuals(data, cfg, active_mask, fill, label):
     prev_is_col = np.roll(active_mask, 1)
     bxp1_idx    = ((~active_mask) & prev_is_col)
     bxp2_idx    = np.roll(bxp1_idx, 1)
+    bxp3_idx    = np.roll(bxp1_idx, 2)
+    bxp4_idx    = np.roll(bxp1_idx, 3)
     # the +2 is IMPORTANT because of how numpy.invert works
-    bxt2_idx    = ((~active_mask + 2) & (~bxp1_idx + 2) & (~bxp2_idx + 2))
+    bxt2_idx    = ((~active_mask + 2) & (~bxp1_idx + 2) & (~bxp2_idx + 2) & (~bxp3_idx + 2) & (~bxp4_idx + 2))
     bxt2_idx[np.asarray(cfg.afterglow.bx_to_clean, dtype=np.int64)] = 0
 
     # calculate the residuals
-    avg_t1p1 = np.array([np.multiply(hist, bxp1_idx).mean() for hist in hists])
-    avg_t1p2 = np.array([np.multiply(hist, bxp2_idx).mean() for hist in hists])
     avg_t2   = np.array([np.multiply(hist, bxt2_idx).mean() for hist in hists])
     
     # get the path to save plots
@@ -155,23 +155,7 @@ def plot_residuals(data, cfg, active_mask, fill, label):
     output_dir = os.path.join(plot_dir, str(fill))
     os.makedirs(output_dir, exist_ok=True)
 
-    # p1 residuals plot
-    fig = create_figure('Mean SBIL [Hz/µb]', 'p1 Residuals [Hz/µb]', fill)
-    plt.plot(avg_col, avg_t1p1, '.')
-
-    png_path = os.path.join(output_dir, f"p1_residuals_{label}.png")
-    plt.savefig(png_path, dpi=300)
-    plt.close(fig)
-
-    # p2 residuals plot
-    fig = create_figure('Mean SBIL [Hz/µb]', 'p2 Residuals [Hz/µb]', fill)
-    plt.plot(avg_col, avg_t1p2, '.')
-
-    png_path = os.path.join(output_dir, f"p2_residuals_{label}.png")
-    plt.savefig(png_path, dpi=300)
-    plt.close(fig)
-
-    # t2 residuals plot
+     # t2 residuals plot
     fig = create_figure('Mean SBIL [Hz/µb]', 'Type 2 Residuals [Hz/µb]', fill)
     plt.plot(avg_col, avg_t2, '.')
 
