@@ -486,8 +486,20 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
             fill,
         )
 
+    # filter out any nans TODO is this physically correct?
+    if not np.all(np.isfinite(data['bxraw'])):
+        log.warning(
+            "[run_fill] fill %d: nan values found in data. Replacing with 0...",
+            fill,
+        )
+        np.nan_to_num(data['bxraw'], copy=False, posinf=0.0, neginf=0.0)
+
+
+
     # before doing any processing, revert the online corrections
     if cfg.steps.revert_online:
+        if cfg.type1.make_plots:
+            plot_hist_bx(data, cfg, fill, 'Online Luminosity')
         data = revert_online_corrections(data, cfg, active_mask)
 
     # plot the uncorrected rates
