@@ -53,7 +53,7 @@ type1:
   offsets: [1, 2, 3, 4]
 
   # Minimum SBIL for including a point in the Type-1 fit
-  sbil_min: 0.1
+  sbil_min: 0.0001
 
   # Whether to produce Type-1 summary plots
   make_plots: true
