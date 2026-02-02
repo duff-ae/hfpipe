@@ -36,18 +36,14 @@ class IOConfig:
     active_mask_pattern: str = ""  # "/path/to/activeBXMask_fill{fill}.npy"
     type1_dir: Optional[str] = None
 
-
 @dataclass
 class AfterglowConfig:
     lambda_reg: float = 0.01
     lambda_nonactive: float = 0.05
     bx_to_clean: Optional[List[int]] = None
-    online_hfsbr: Optional[str] = None
     hfsbr_pattern: Optional[str] = None
     n_jobs: int = -1
     sigvis: Optional[float] = None
-
-
 
 @dataclass
 class Type1Config:
@@ -69,11 +65,20 @@ class Type1Config:
     save_hd5: bool = False
 
 @dataclass
+class OnlineConfig:
+    hfsbr: Optional[str] = None
+    linear_type1: Optional[List[float]] = field(default_factory=lambda: [0., 0., 0.])
+    quad_type1: Optional[List[float]] = field(default_factory=lambda: [0., 0., 0.])
+    pedestal_table: Optional[str] = None
+
+
+@dataclass
 class PipelineConfig:
     io: IOConfig
     steps: StepsConfig
     afterglow: AfterglowConfig
     type1: Type1Config
+    online: OnlineConfig
     fills: List[int]
 
 
@@ -85,6 +90,7 @@ def load_config(path: str) -> PipelineConfig:
     steps = StepsConfig(**cfg_dict.get("steps", {}))
     afterglow = AfterglowConfig(**cfg_dict.get("afterglow", {}))
     type1 = Type1Config(**cfg_dict.get("type1", {}))
+    online = OnlineConfig(**cfg_dict.get("online", {}))
     fills = cfg_dict.get("fills", [])
 
     return PipelineConfig(
@@ -92,5 +98,6 @@ def load_config(path: str) -> PipelineConfig:
         steps=steps,
         afterglow=afterglow,
         type1=type1,
+        online=online,
         fills=fills,
     )

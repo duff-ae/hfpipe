@@ -57,7 +57,13 @@ def _get_type1_coeff_path(cfg: PipelineConfig, fill: int) -> str:
 # ---------------------------------------------------------------------------
 # Step 0: revert the online corrections
 # ---------------------------------------------------------------------------
-def revert_afterglow_batch(mu_batch, HFSBR, active_mask):
+def revert_pedestal(mu_batch, pedestal):
+    mu = mu_batch.copy()
+    for i in range(4):
+        mu[:, i::4] += pedestal[:,i][:, None]
+    return mu
+
+def revert_afterglow(mu_batch, HFSBR, linear, quad, active_mask):
     """
     Revert afterglow for a batch of time slices.
     mu_batch: shape (batch_size, N)
@@ -69,15 +75,21 @@ def revert_afterglow_batch(mu_batch, HFSBR, active_mask):
         if not active_mask[ibx]:
             continue
 
-        base = mu[:, ibx][:, None]  # shape (B, 1)
+        base = mu[:, ibx]
+        base2 = base * base
 
-        # No wrap: j = ibx+1 .. N-1
-        if ibx + 1 < N:
-            mu[:, ibx + 1:N] += base * HFSBR[1:N - ibx][None, :]
+        type_ = 0
+        for d in range(1, N):
+            idx = (ibx + d) % N
 
-        # Wrap: j = 0 .. ibx-1
-        if ibx > 0:
-            mu[:, 0:ibx] += base * HFSBR[N - ibx:N][None, :]
+            if type_ < 3:
+                SBR = base2 * quad[type_] + base * linear[type_] + HFSBR[d]
+            else:
+                SBR = HFSBR[d]
+
+            mu[:, idx] += base * SBR
+
+            type_ += 1
 
     return mu
 
@@ -90,13 +102,17 @@ def revert_online_corrections(data: dict, cfg: PipelineConfig, active_mask: np.n
     fill = int(fills[0])
     
     # --- load HFSBR matrix ---
-    hfsbr_path = cfg.afterglow.online_hfsbr.format(fill=fill)
+    hfsbr_path = cfg.online.hfsbr.format(fill=fill)
     if not os.path.exists(hfsbr_path):
         raise FileNotFoundError(f"HFSBR file not found: {hfsbr_path}")
 
     HFSBR = np.loadtxt(hfsbr_path, dtype=np.float64, delimiter=",")
     HFSBR = HFSBR.astype(np.float64, copy=False)
     N     = HFSBR.shape[0]
+
+    # --- online type1 corrections ---
+    lin_type1 = cfg.online.linear_type1
+    quad_type1 = cfg.online.quad_type1
 
     if N != BX_LEN:
         raise ValueError(f"HFSBR len={N} does not match BX_LEN={BX_LEN}")
@@ -108,6 +124,10 @@ def revert_online_corrections(data: dict, cfg: PipelineConfig, active_mask: np.n
     bxraw_obs = data["bxraw"]
     assert bxraw_obs.shape[1] == BX_LEN
 
+    # first revert pedestal
+    if "pedestal" in data.keys():
+        bxraw_obs = revert_pedestal(bxraw_obs, data["pedestal"])
+
     # Split T into batches
     n_jobs = cfg.afterglow.n_jobs
     T = bxraw_obs.shape[0]
@@ -116,7 +136,7 @@ def revert_online_corrections(data: dict, cfg: PipelineConfig, active_mask: np.n
 
     # Parallel processing
     results = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(revert_afterglow_batch)(batch, HFSBR, active_mask)
+        delayed(revert_afterglow)(batch, HFSBR, lin_type1, quad_type1, active_mask)
         for batch in tqdm(batches, desc="Reverting Online Afterglow", unit="batch")
     )
 
@@ -440,6 +460,10 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
 
     # --- 1) load input data (may contain multiple files and multiple fills) ---
     data = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.io.node)
+    
+    if cfg.online.pedestal_table is not None:
+        ped = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.online.pedestal_table)
+        data["pedestal"] = ped["bxraw"]
     
     # --- 1a) keep only rows corresponding to the current fill ---
     fill_arr = data.get("fillnum", None)
