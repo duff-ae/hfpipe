@@ -65,8 +65,8 @@ online:
   hfsbr: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Apr24_24.txt"
 
   # online type 1
-  linear_type1: [0.00115058, 9.62720752e-05, -2.38976234e-05]
-  quad_type1: [0.00118399, 9.97966854e-05, 7.25134025e-05]
+  linear_type1: [0, 0, 0]
+  quad_type1: [0, 0, 0]
 
   # online pedestal
   # set to null if there is no online pedestal

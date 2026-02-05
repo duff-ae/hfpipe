@@ -55,6 +55,50 @@ def _get_type1_coeff_path(cfg: PipelineConfig, fill: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helpers for merging tables
+# ---------------------------------------------------------------------------
+
+# for double checking if a column is all unique values
+# sanity check used before merging two tables on a column
+def _is_unique_columns(cols):
+    stacked = np.column_stack(cols)
+    return np.unique(stacked, axis=0).shape[0] == stacked.shape[0]
+
+# for merging one column from a dictionary into another
+# useful for getting the pedestal information
+def _inner_merge_one_column(left, right, on, right_col, new_col_name):
+   # Build structured arrays for keys
+    left_keys = np.core.records.fromarrays(
+        [left[c] for c in on],
+        names=",".join(on)
+    )
+
+    right_keys = np.core.records.fromarrays(
+        [right[c] for c in on],
+        names=",".join(on)
+    )
+
+    # Sort right keys for fast lookup
+    order = np.argsort(right_keys)
+    right_keys_sorted = right_keys[order]
+    right_vals_sorted = right[right_col][order]
+
+    # Find matches
+    idx = np.searchsorted(right_keys_sorted, left_keys)
+    mask = (idx < right_keys_sorted.size) & (right_keys_sorted[idx] == left_keys)
+
+    # Build merged dict
+    merged = {}
+
+    for k, v in left.items():
+        merged[k] = v[mask]
+
+    merged[new_col_name] = right_vals_sorted[idx[mask]]
+
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # Step 0: revert the online corrections
 # ---------------------------------------------------------------------------
 def revert_pedestal(mu_batch, pedestal):
@@ -64,10 +108,6 @@ def revert_pedestal(mu_batch, pedestal):
     return mu
 
 def revert_afterglow(mu_batch, HFSBR, linear, quad, active_mask):
-    """
-    Revert afterglow for a batch of time slices.
-    mu_batch: shape (batch_size, N)
-    """
     mu = mu_batch.copy()
     B, N = mu.shape
     
@@ -463,7 +503,18 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
     
     if cfg.online.pedestal_table is not None:
         ped = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.online.pedestal_table)
-        data["pedestal"] = ped["bxraw"]
+
+        if data["timestampsec"].size != ped["timestampsec"].size:
+            log.warning(
+                "[run_fill] fill %d: pedestal data not present for %d entries. Dropping rows...",
+                fill,
+                data["timestampsec"].size - ped["timestampsec"].size,
+            )
+
+        if not _is_unique_columns([ped["timestampsec"], ped["timestampmsec"]]):
+            raise ValueError("Timestamp values are not unique. Choose another column to merge on.")
+
+        data = _inner_merge_one_column(data, ped, ["timestampsec", "timestampmsec"], "bxraw", "pedestal")
     
     # --- 1a) keep only rows corresponding to the current fill ---
     fill_arr = data.get("fillnum", None)

@@ -29,7 +29,8 @@ afterglow:
   # BX indices to hard-clean (mu_true = 0) – analogue of BX_TO_CLEAN
   bx_to_clean: [3488, 3489, 3490, 3491, 3553, 3554, 3555, 3556, 3557]
   
-  hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfet_lsq_test.txt"
+  #hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfet_10843.txt"
+  hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfet_online_Apr13_24.txt"
   
   # Regularization strengths for the LSQ inversion
   lambda_reg: 0.01
@@ -46,7 +47,7 @@ type1:
   offsets: [1, 2, 3, 4]
 
   # Minimum SBIL for including a point in the Type-1 fit
-  sbil_min: 0.0001
+  sbil_min: 0.01
 
   # Whether to produce Type-1 summary plots
   make_plots: true
