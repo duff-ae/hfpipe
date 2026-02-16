@@ -159,6 +159,16 @@ def plot_residuals(data, cfg, active_mask, fill, label):
     fig = create_figure('Mean SBIL [Hz/µb]', 'Type 2 Residuals [Hz/µb]', fill)
     plt.plot(avg_col, avg_t2, '.')
 
+    # relocate axis scale text so that it isn't hidden by the "CMS"
+    fig.canvas.draw()
+    ax = plt.gca()
+    scaling_factor_txt = ax.yaxis.get_offset_text().get_text()
+    if scaling_factor_txt != "" and scaling_factor_txt != "1":
+        scaling_factor = float(scaling_factor_txt)
+        scaler_exp = int(np.log10(1/scaling_factor))
+        ax.set_ylabel(ax.get_ylabel() + " $\\times 10^{"+f"{scaler_exp:d}"+"}$")
+    ax.yaxis.get_offset_text().set_visible(False)
+
     png_path = os.path.join(output_dir, f"t2_residuals_{label}.png")
     plt.savefig(png_path, dpi=300)
     plt.close(fig)
