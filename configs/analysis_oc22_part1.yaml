@@ -1,14 +1,13 @@
 io:
   # Input HFET hd5 files, one file per fill
-  # Expected path: /cephfs/brilshare/alshevel/hf_origin/hfet/25/<fill>/<fill>_*.hd5
-  #input_dir: "/cephfs/brilshare/alshevel/hf_origin/hfet/25"
-  input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2022/physics"
+  #input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2022/physics"
+  input_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/22_uncorr"
   beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2022/physics"
-  input_pattern: "{fill}/{fill}_*.hd5"
+  #input_pattern: "{fill}/{fill}_*.hd5"
+  input_pattern: "{fill}/{fill}.hd5"
 
   # Output files, to avoid overwriting the old version
-  # Resulting path: /cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_test/<fill>/<fill>.hd5
-  output_dir: "/eos/user/l/leeja/HF/data_hfpipe/OC"
+  output_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/22"
   output_pattern: "{fill}/{fill}.hd5"
 
   # HDF5 node / key with the HF table
@@ -19,13 +18,14 @@ io:
   active_mask_pattern: "/cephfs/brilshare/alshevel/hf_masks/activeBXMask_fill{fill}.npy"
 
   # Directory where Type-1 diagnostic plots (etc.) are stored
-  type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/OC"
+  type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/OC/22"
 
 steps:
-  revert_online: true
+  revert_online: false
   restore_rates: true
   compute_type1: true
   apply_type1:   true
+  bunch_train:   true
 
 afterglow:
 
@@ -40,9 +40,8 @@ afterglow:
   
   n_jobs: 16
 
-  # From your note: sigvis = 3170.19
   # Conversion example: bx = bxraw * 11245.6 / sigvis
-  sigvis: 3170.19
+  sigvis: 931.3
 
 type1:
   # Offsets (in BX) between the main bunch and the tail to be fitted
@@ -60,9 +59,27 @@ type1:
   # Do not store heavy intermediate type1_{offset}.h5 files
   save_hd5: false
 
+bunch_train:
+  # location of data to use as a linear reference for the bunch train effect
+  linear_reference: "/eos/cms/store/group/dpg_bril/comm_bril/2022/reprocessed/23v1/hfet"
+  input_pattern: "{fill}/{fill}_*.hd5"
+  node: "hfetlumi"
+  #linear_reference: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
+  #input_pattern: "{fill}/{fill}_*.hd5"
+  #node: "bcm1futcalumi"
+
+  # order of the poly fit to apply
+  order: 3
+  
+  # Minimum SBIL for including a point in the fit
+  sbil_min: 0.1
+
+  make_plots: True
+  save_hd5: False
+
 online:
   # for restoring rates from online
-  online_hfsbr: "/home/leeja/hfpipe/input/afterglow/hfoc_online_oldest.txt"
+  hfsbr: "/home/leeja/hfpipe/input/afterglow/hfoc_online_oldest.txt"
   
   # online type 1
   linear_type1: [0, 0, 0]
@@ -73,5 +90,72 @@ online:
   pedestal_table: null
 
 fills:
-  # For testing: run over a single fill. Later this can be replaced by a list of stable fills.
-  - 11164
+ - 8115
+ - 8113
+ - 8112
+ - 8111
+ - 8108
+ - 8106
+ - 8103
+ - 8102
+ - 8100
+ - 8099
+ - 8098
+ - 8094
+ - 8091
+ - 8088
+ - 8087
+ - 8083
+ - 8081
+ - 8079
+ - 8078
+ - 8076
+ - 8073
+ - 8072
+ - 8068
+ - 8067
+ - 8063
+ - 8062
+ - 8059
+ - 8058
+ - 8057
+ - 8046
+ - 8043
+ - 8033
+ - 8030
+ - 8027
+ - 8023
+ - 8022
+ - 8020
+ - 8019
+ - 8018
+ - 8017
+ - 8016
+ - 8007
+ - 7978
+ - 7969
+ - 7967
+ - 7966
+ - 7965
+ - 7963
+ - 7960
+ - 7923
+ - 7921
+ - 7920
+ - 7916
+ - 7895
+ - 7876
+ - 7822
+ - 7733
+ - 7703
+ - 7702
+ - 7697
+ - 7696
+ - 7694
+ - 7692
+ - 7670
+ - 7663
+ - 7662
+ - 7652
+ - 7533
+ - 7532

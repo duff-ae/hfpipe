@@ -1,14 +1,11 @@
 io:
   # Input HFET hd5 files, one file per fill
-  # Expected path: /cephfs/brilshare/alshevel/hf_origin/hfet/25/<fill>/<fill>_*.hd5
-  #input_dir: "/cephfs/brilshare/alshevel/hf_origin/hfet/25"
-  input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
+  input_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/25_uncorr"
   beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
-  input_pattern: "{fill}/{fill}_*.hd5"
+  input_pattern: "{fill}/{fill}.hd5"
 
   # Output files, to avoid overwriting the old version
-  # Resulting path: /cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_test/<fill>/<fill>.hd5
-  output_dir: "/eos/user/l/leeja/HF/data_hfpipe"
+  output_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/25"
   output_pattern: "{fill}/{fill}.hd5"
 
   # HDF5 node / key with the HF table
@@ -19,13 +16,14 @@ io:
   active_mask_pattern: "/cephfs/brilshare/alshevel/hf_masks/activeBXMask_fill{fill}.npy"
 
   # Directory where Type-1 diagnostic plots (etc.) are stored
-  type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe"
+  type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/OC/25"
 
 steps:
-  revert_online: true
+  revert_online: false
   restore_rates: true
-  compute_type1: true
+  compute_type1: false
   apply_type1:   true
+  bunch_train:   true
 
 afterglow:
 
@@ -33,6 +31,7 @@ afterglow:
   bx_to_clean: [3488, 3489, 3490, 3491, 3553, 3554, 3555, 3556, 3557]
   
   hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfoc_10843.txt"
+  #hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Apr24_24.txt"
   
   # Regularization strengths for the LSQ inversion
   lambda_reg: 0.01
@@ -40,9 +39,8 @@ afterglow:
   
   n_jobs: 16
 
-  # From your note: sigvis = 3170.19
   # Conversion example: bx = bxraw * 11245.6 / sigvis
-  sigvis: 3170.19
+  sigvis: 931.3
 
 type1:
   # Offsets (in BX) between the main bunch and the tail to be fitted
@@ -60,6 +58,24 @@ type1:
   # Do not store heavy intermediate type1_{offset}.h5 files
   save_hd5: false
 
+bunch_train:
+  # location of data to use as a linear reference for the bunch train effect
+  linear_reference: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_final"
+  input_pattern: "{fill}/{fill}_*.hd5"
+  node: "hfetlumi"
+  #linear_reference: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
+  #input_pattern: "{fill}/{fill}_*.hd5"
+  #node: "bcm1futcalumi"
+
+  # order of the poly fit to apply
+  order: 3
+  
+  # Minimum SBIL for including a point in the fit
+  sbil_min: 0.1
+
+  make_plots: True
+  save_hd5: False
+
 online:
   # for restoring rates from online
   hfsbr: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Apr24_24.txt"
@@ -73,5 +89,236 @@ online:
   pedestal_table: null
 
 fills:
-  # For testing: run over a single fill. Later this can be replaced by a list of stable fills.
+  - 10489
+  - 10491
+  - 10530
+  - 10589
+  - 10590
+  - 10591
+  - 10606
+  - 10611
+  - 10612
+  - 10616
+  - 10623
+  - 10626
+  - 10628
+  - 10629
+  - 10638
+  - 10639
+  - 10640
+  - 10644
+  - 10645
+  - 10647
+  - 10649
+  - 10650
+  - 10653
+  - 10656
+  - 10659
+  - 10663
+  - 10665
+  - 10666
+  - 10670
+  - 10671
+  - 10672
+  - 10673
+  - 10674
+  - 10675
+  - 10676
+  - 10677
+  - 10678
+  - 10683
+  - 10685
+  - 10689
+  - 10690
+  - 10691
+  - 10696
+  - 10697
+  - 10701
+  - 10702
+  - 10704
+  - 10705
+  - 10709
+  - 10713
+  - 10717
+  - 10718
+  - 10721
+  - 10731
+  - 10732
+  - 10739
+  - 10821
+  - 10824
+  - 10825
+  - 10826
+  - 10827
+  - 10831
+  - 10843
+  - 10845
+  - 10848
+  - 10850
+  - 10852
+  - 10854
+  - 10855
+  - 10857
+  - 10859
+  - 10862
+  - 10865
+  - 10866
+  - 10868
+  - 10871
+  - 10874
+  - 10875
+  - 10876
+  - 10878
+  - 10883
+  - 10884
+  - 10886
+  - 10887
+  - 10895
+  - 10904
+  - 10905
+  - 10906
+  - 10907
+  - 10908
+  - 10911
+  - 10913
+  - 10915
+  - 10919
+  - 10920
+  - 10921
+  - 10922
+  - 10926
+  - 10927
+  - 10928
+  - 10931
+  - 10932
+  - 10935
+  - 10938
+  - 10939
+  - 10940
+  - 10943
+  - 10945
+  - 10946
+  - 10948
+  - 10950
+  - 10952
+  - 10954
+  - 10955
+  - 10956
+  - 10959
+  - 10961
+  - 10962
+  - 10964
+  - 10968
+  - 10969
+  - 10971
+  - 10972
+  - 10973
+  - 10975
+  - 10976
+  - 10980
+  - 10981
+  - 10982
+  - 10984
+  - 10985
+  - 10986
+  - 10988
+  - 10990
+  - 10992
+  - 10993
+  - 10994
+  - 10997
+  - 11044
+  - 11045
+  - 11047
+  - 11050
+  - 11053
+  - 11055
+  - 11056
+  - 11057
+  - 11058
+  - 11059
+  - 11066
+  - 11067
+  - 11069
+  - 11071
+  - 11072
+  - 11076
+  - 11077
+  - 11079
+  - 11081
+  - 11085
+  - 11086
+  - 11088
+  - 11089
+  - 11090
+  - 11091
+  - 11092
+  - 11094
+  - 11096
+  - 11098
+  - 11101
+  - 11102
+  - 11105
+  - 11106
+  - 11107
+  - 11108
+  - 11109
+  - 11110
+  - 11114
+  - 11116
+  - 11118
+  - 11119
+  - 11120
+  - 11121
+  - 11124
+  - 11126
+  - 11128
+  - 11129
+  - 11130
+  - 11132
+  - 11133
+  - 11134
+  - 11135
   - 11164
+  - 11165
+  - 11170
+  - 11171
+  - 11173
+  - 11176
+  - 11178
+  - 11179
+  - 11181
+  - 11183
+  - 11189
+  - 11190
+  - 11191
+  - 11193
+  - 11195
+  - 11196
+  - 11197
+  - 11200
+  - 11201
+  - 11202
+  - 11203
+  - 11205
+  - 11208
+  - 11209
+  - 11210
+  - 11211
+  - 11212
+  - 11214
+  - 11217
+  - 11218
+  - 11220
+  - 11221
+  - 11222
+  - 11223
+  - 11226
+  - 11227
+  - 11229
+  - 11230
+  - 11236
+  - 11237
+  - 11238
+  - 11239
+  - 11245

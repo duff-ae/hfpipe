@@ -223,7 +223,7 @@ class AfterglowSolver:
             maxiter=self.cg_maxiter,
         )
 
-        if info != 0:
+        if False:#info != 0:
             # Fallback: retry with zero initial guess
             x0_fallback = np.zeros_like(rhs)
             x, info2 = cg(

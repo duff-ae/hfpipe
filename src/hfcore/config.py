@@ -24,6 +24,9 @@ class StepsConfig:
     # 4) вычитание Type1 из bxraw (когда допишем apply_type1_step)
     apply_type1: bool = False
 
+    # 5) fit and apply bunch train corrections
+    bunch_train: bool = False
+
 
 @dataclass
 class IOConfig:
@@ -65,6 +68,16 @@ class Type1Config:
     save_hd5: bool = False
 
 @dataclass
+class BunchTrainConfig:
+    linear_reference: Optional[str] = None
+    input_pattern: Optional[str] = None
+    node: str = "hfetlumi"
+    order: int = 1
+    sbil_min: float = 0.1
+    make_plots: bool = False
+    save_hd5: bool = False
+
+@dataclass
 class OnlineConfig:
     hfsbr: Optional[str] = None
     linear_type1: Optional[List[float]] = field(default_factory=lambda: [0., 0., 0.])
@@ -78,6 +91,7 @@ class PipelineConfig:
     steps: StepsConfig
     afterglow: AfterglowConfig
     type1: Type1Config
+    bunch_train: BunchTrainConfig
     online: OnlineConfig
     fills: List[int]
 
@@ -90,6 +104,7 @@ def load_config(path: str) -> PipelineConfig:
     steps = StepsConfig(**cfg_dict.get("steps", {}))
     afterglow = AfterglowConfig(**cfg_dict.get("afterglow", {}))
     type1 = Type1Config(**cfg_dict.get("type1", {}))
+    bunch_train = BunchTrainConfig(**cfg_dict.get("bunch_train", {}))
     online = OnlineConfig(**cfg_dict.get("online", {}))
     fills = cfg_dict.get("fills", [])
 
@@ -98,6 +113,7 @@ def load_config(path: str) -> PipelineConfig:
         steps=steps,
         afterglow=afterglow,
         type1=type1,
+        bunch_train=bunch_train,
         online=online,
         fills=fills,
     )

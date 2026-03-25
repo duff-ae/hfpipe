@@ -1,11 +1,13 @@
 io:
   # Input HFET hd5 files, one file per fill
-  input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
+  #input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
+  input_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfet/25_uncorr"
   beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
-  input_pattern: "{fill}/{fill}_*.hd5"
+  #input_pattern: "{fill}/{fill}_*.hd5"
+  input_pattern: "{fill}/{fill}.hd5"
 
   # Output files, to avoid overwriting the old version
-  output_dir: "/eos/user/l/leeja/HF/data_hfpipe/ET"
+  output_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfet/25"
   output_pattern: "{fill}/{fill}.hd5"
 
   # HDF5 node / key with the HF table
@@ -16,13 +18,14 @@ io:
   active_mask_pattern: "/cephfs/brilshare/alshevel/hf_masks/activeBXMask_fill{fill}.npy"
 
   # Directory where Type-1 diagnostic plots (etc.) are stored
-  type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/ET"
+  type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/ET/25"
 
 steps:
-  revert_online: true
+  revert_online: false
   restore_rates: true
   compute_type1: true
   apply_type1:   true
+  bunch_train:   false
 
 afterglow:
 
@@ -58,6 +61,21 @@ type1:
   # Do not store heavy intermediate type1_{offset}.h5 files
   save_hd5: false
 
+bunch_train:
+  # location of data to use as a linear reference for the bunch train effect
+  linear_reference: null
+  input_pattern: "{fill}/{fill}_*.hd5"
+  node: null
+
+  # order of the poly fit to apply
+  order: 3
+
+  # Minimum SBIL for including a point in the fit
+  sbil_min: 0.1
+
+  make_plots: True
+  save_hd5: False
+
 online:
   # for restoring rates from online
   hfsbr: "/home/leeja/hfpipe/input/afterglow/hfet_online_Apr13_24.txt"
@@ -71,5 +89,11 @@ online:
   pedestal_table: "hfEtPedestal"
 
 fills:
-  # For testing: run over a single fill. Later this can be replaced by a list of stable fills.
-  - 11164
+ - 10813
+ - 10808
+ - 10807
+ - 10806
+ - 10805
+ - 10804
+ - 10803
+ - 10802

@@ -1,39 +1,40 @@
+# online configuration valid between the dates of Aug 11, 2022 and Apr 24, 2024
+
 io:
   # Input HFET hd5 files, one file per fill
-  #input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
-  input_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfet/25_uncorr"
-  beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
+  #input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2024/physics"
+  input_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/24_uncorr"
+  beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2024/physics"
   #input_pattern: "{fill}/{fill}_*.hd5"
   input_pattern: "{fill}/{fill}.hd5"
 
   # Output files, to avoid overwriting the old version
-  output_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfet/25"
+  output_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/24"
   output_pattern: "{fill}/{fill}.hd5"
 
   # HDF5 node / key with the HF table
-  node: "hfetlumi"
+  node: "hfoclumi"
 
   # Precomputed active BX mask (shape=(3564,), dtype=int)
   # Can be produced once from the beam hd5
   active_mask_pattern: "/cephfs/brilshare/alshevel/hf_masks/activeBXMask_fill{fill}.npy"
 
   # Directory where Type-1 diagnostic plots (etc.) are stored
-  type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/ET/25"
+  type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/OC/24"
 
 steps:
   revert_online: false
   restore_rates: true
   compute_type1: true
   apply_type1:   true
-  bunch_train:   false
+  bunch_train:   true
 
 afterglow:
 
   # BX indices to hard-clean (mu_true = 0) – analogue of BX_TO_CLEAN
   bx_to_clean: [3488, 3489, 3490, 3491, 3553, 3554, 3555, 3556, 3557]
   
-  #hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfet_10843.txt"
-  hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfet_online_Apr13_24.txt"
+  hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfoc_10843.txt"
   
   # Regularization strengths for the LSQ inversion
   lambda_reg: 0.01
@@ -41,16 +42,15 @@ afterglow:
   
   n_jobs: 16
 
-  # From your note: sigvis = 3170.19
   # Conversion example: bx = bxraw * 11245.6 / sigvis
-  sigvis: 3170.19
+  sigvis: 931.3
 
 type1:
   # Offsets (in BX) between the main bunch and the tail to be fitted
   offsets: [1, 2, 3, 4]
 
   # Minimum SBIL for including a point in the Type-1 fit
-  sbil_min: 0.001
+  sbil_min: 0.1
 
   # Whether to produce Type-1 summary plots
   make_plots: true
@@ -63,13 +63,16 @@ type1:
 
 bunch_train:
   # location of data to use as a linear reference for the bunch train effect
-  linear_reference: null
+  linear_reference: "/eos/cms/store/group/dpg_bril/comm_bril/2024/reprocessed/hfet_tmp"
   input_pattern: "{fill}/{fill}_*.hd5"
-  node: null
+  node: "hfetlumi"
+  #linear_reference: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
+  #input_pattern: "{fill}/{fill}_*.hd5"
+  #node: "bcm1futcalumi"
 
   # order of the poly fit to apply
   order: 3
-
+  
   # Minimum SBIL for including a point in the fit
   sbil_min: 0.1
 
@@ -78,60 +81,45 @@ bunch_train:
 
 online:
   # for restoring rates from online
-  hfsbr: "/home/leeja/hfpipe/input/afterglow/hfet_online_Apr13_24.txt"
+  hfsbr: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Aug10_22.txt"
 
   # online type 1
-  linear_type1: [0, 0, 0]
-  quad_type1: [0, 0, 0]
+  linear_type1: [0., 0., 0.]
+  quad_type1: [0., 0., 0.]
 
-  # online pedestal table name in ratefile
+  # online pedestal
   # set to null if there is no online pedestal
-  pedestal_table: "hfEtPedestal"
+  pedestal_table: null
 
 fills:
- - 11328
- - 11382
- - 11383
- - 11388
- - 11330
- - 11343
- - 11361
- - 11384
- - 11344
- - 11381
- - 11316
- - 11318
- - 11323
- - 11334
- - 11338
- - 11331
- - 11333
- - 11350
- - 11357
- - 11359
- - 11366
- - 11380
- - 11387
- - 11389
- - 11390
- - 11335
- - 11353
- - 11356
- - 11377
- - 11391
- - 11310
- - 11314
- - 11332
- - 11349
- - 11352
- - 11304
- - 11305
- - 11307
- - 11303
- - 11292
- - 11348
- - 11290
- - 11365
- - 11372
- - 11297
- - 11289
+  - 9400
+  - 9448
+  - 9473
+  - 9474
+  - 9475
+  - 9476
+  - 9479
+  - 9483
+  - 9485
+  - 9496
+  - 9497
+  - 9499
+  - 9509
+  - 9510
+  - 9512
+  - 9514
+  - 9517
+  - 9518
+  - 9519
+  - 9520
+  - 9521
+  - 9523
+  - 9525
+  - 9529
+  - 9530
+  - 9537
+  - 9539
+  - 9543
+  - 9548
+  - 9549
+  - 9559
