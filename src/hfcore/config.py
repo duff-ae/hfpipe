@@ -10,7 +10,6 @@ import yaml
 @dataclass
 class OnlineRecoveryConfig:
     method: str = "online"          # "online" or "tables"
-    debug_compare: bool = False
 
     pedestal_node: str = "hfEtPedestal"
     afterglow_node: str = "hfafterglowfrac"
@@ -57,6 +56,7 @@ class AfterglowConfig:
     hfsbr_pattern: Optional[str] = None
     n_jobs: int = -1
     sigvis: Optional[float] = None
+    fixed_pedestal_4: Optional[List[float]] = None
 
 
 @dataclass

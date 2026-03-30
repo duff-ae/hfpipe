@@ -15,14 +15,13 @@ from .hd5schema import BX_LEN
 from .afterglow_lsq import build_afterglow_solver_from_file
 from .type1_fit import compute_type1_coeffs, save_type1_coeffs, analyze_type1_step
 from .type1_apply import apply_type1_batch
-from .online_recovery import reconstruct_from_tables_batch, reconstruct_from_online_batch, compare_recovery_methods
+from .online_recovery import reconstruct_from_tables_batch, reconstruct_from_online_batch
 from .plotter import plot_hist_bx, plot_lumi_comparison, plot_residuals, plot_lasers
 
 from .config import PipelineConfig
 
 
 log = logging.getLogger("hfpipe")
-
 
 def _align_aux_by_keys(
     main: Dict[str, np.ndarray],
@@ -60,6 +59,71 @@ def _align_aux_by_keys(
         print(f"[WARN] _align_aux_by_keys: {missing} rows had no match in aux node")
 
     return out
+
+def _subtract_fixed_pedestal_mod4_inplace(data: dict, ped4) -> None:
+    """
+    Subtract constant mod4 pedestal from bxraw only:
+      bxraw[:, bx] -= ped4[bx % 4]
+    """
+    if ped4 is None:
+        return
+
+    if "bxraw" not in data:
+        raise KeyError("fixed_pedestal_4 is set but data has no 'bxraw'")
+
+    ped4 = np.asarray(ped4, dtype=np.float32).ravel()
+    if ped4.shape[0] != 4:
+        raise ValueError(f"fixed_pedestal_4 must have length 4, got shape {ped4.shape}")
+
+    bxraw = np.asarray(data["bxraw"])
+    if bxraw.ndim != 2 or bxraw.shape[1] != BX_LEN:
+        raise ValueError(f"bxraw has shape {bxraw.shape}, expected (T, {BX_LEN})")
+
+    ped_vec = ped4[np.arange(BX_LEN) % 4][None, :]  # (1, BX_LEN)
+    data["bxraw"] = (bxraw - ped_vec).astype(bxraw.dtype, copy=False)
+
+    log.info("[fixed_pedestal_4] Subtracted from bxraw (ped4=%s)", ped4.tolist())
+
+def _recompute_derived_from_bxraw_inplace(
+    data: dict,
+    cfg: PipelineConfig,
+    active_mask: np.ndarray,
+) -> None:
+    """
+    Recompute ONLY derived columns from bxraw:
+      - bx      = bxraw * scale
+      - avgraw  = sum(bxraw over active BX)   (NOT mean)
+      - avg     = avgraw * scale
+
+    This must be the single source of truth for bx/avgraw/avg.
+    """
+    if "bxraw" not in data:
+        raise KeyError("_recompute_derived_from_bxraw_inplace: missing 'bxraw' in data")
+
+    bxraw = np.asarray(data["bxraw"], dtype=np.float32)
+    if bxraw.ndim != 2 or bxraw.shape[1] != BX_LEN:
+        raise ValueError(
+            f"_recompute_derived_from_bxraw_inplace: bxraw has shape {bxraw.shape}, expected (T, {BX_LEN})"
+        )
+
+    mask = np.asarray(active_mask, dtype=np.int32).ravel()
+    if mask.shape[0] != BX_LEN:
+        raise ValueError(
+            f"_recompute_derived_from_bxraw_inplace: active_mask len={mask.shape[0]} != BX_LEN={BX_LEN}"
+        )
+
+    sigvis = getattr(cfg.afterglow, "sigvis", None)
+    scale = 1.0 if not sigvis else 11245.6 / float(sigvis)
+
+    # bx (lumi per BX)
+    data["bx"] = (bxraw * scale).astype(np.float32, copy=False)
+
+    # avgraw = SUM over active BX (mu-space)
+    avgraw = (bxraw * mask[None, :]).sum(axis=1)
+    data["avgraw"] = avgraw.astype(np.float32, copy=False)
+
+    # avg = scaled sum over active BX (lumi-space)
+    data["avg"] = (avgraw * scale).astype(np.float32, copy=False)
 
 # ---------------------------------------------------------------------------
 # Helpers for Type-1 paths
@@ -167,12 +231,11 @@ def recover_bxraw_step(
 
     use_tables = (rec_cfg.method == "tables")
     use_online = (rec_cfg.method == "online")
-    do_debug = bool(rec_cfg.debug_compare)
 
     states_tables = None
     states_online = None
 
-    if use_tables or do_debug:
+    if use_tables:
         ped_node = rec_cfg.pedestal_node
         aft_node = rec_cfg.afterglow_node
 
@@ -205,13 +268,14 @@ def recover_bxraw_step(
             afterglow_frac=aft_frac,
         )
 
-    if use_online or do_debug:
+    if use_online:
         hfsbr = _load_hfsbr_for_online(cfg, fill)
         states_online = reconstruct_from_online_batch(
             bxraw_final=bxraw_final,
             hfsbr=hfsbr,
             active_mask=active_mask,
             zero_bx=(3553, 3554, 3555, 3556, 3557),
+            show_progress=True,
         )
 
     if use_tables:
@@ -220,19 +284,6 @@ def recover_bxraw_step(
         if states_online is None:
             raise RuntimeError("online_recovery: states_online is None, check config")
         data["bxraw"] = states_online.mu_before
-
-    if do_debug and (states_tables is not None) and (states_online is not None):
-        debug = compare_recovery_methods(states_tables, states_online)
-        pull_before = debug["pull_mu_before"].ravel()
-        mean_pull = float(np.nanmean(pull_before))
-        std_pull = float(np.nanstd(pull_before))
-
-        log.info(
-            "[online_recovery] fill %d: pull(mu_before) mean=%.3f std=%.3f",
-            fill,
-            mean_pull,
-            std_pull,
-        )
 
     return data
 
@@ -251,6 +302,7 @@ def calculate_dynamic_pedestal(mu_hist: np.ndarray) -> np.ndarray:
     n_sample = 13
     pedestal = np.zeros(4, dtype=np.float32)
 
+    
     # last 52 BX (3500..3551)
     base = 3500
     for ibx in range(4):
@@ -258,6 +310,7 @@ def calculate_dynamic_pedestal(mu_hist: np.ndarray) -> np.ndarray:
         for j in range(ibx, 4 * n_sample, 4):
             s += mu_hist[base + j]
         pedestal[ibx] = s / n_sample
+    
     return pedestal
 
 
@@ -327,12 +380,7 @@ def restore_rates_step(data: dict, cfg: PipelineConfig, active_mask: np.ndarray)
     # ------------------------------------------------------------------
     # Recompute bx and avg (these should be AFTER pedestal subtraction)
     # ------------------------------------------------------------------
-    sigvis = cfg.afterglow.sigvis
-    scale = 1.0 if not sigvis else 11245.6 / float(sigvis)
-
-    bx_lumi = (mu_corr * scale).astype(np.float32, copy=False)
-    data["bx"] = bx_lumi
-    data["avg"] = bx_lumi.mean(axis=1).astype(np.float32)
+    _recompute_derived_from_bxraw_inplace(data, cfg, active_mask)
 
     return data
 
@@ -486,14 +534,6 @@ def apply_type1_step(data, cfg, active_mask: np.ndarray, fill: int):
 
     data["bxraw"] = corrected_mu
 
-    # --- recompute bx and avg AFTER Type-1 subtraction ---
-    sigvis = getattr(cfg.afterglow, "sigvis", None)
-    scale = 1.0 if not sigvis else 11245.6 / float(sigvis)
-
-    bx_lumi = (corrected_mu * scale).astype(np.float32, copy=False)
-    data["bx"] = bx_lumi
-    data["avg"] = bx_lumi.mean(axis=1).astype(np.float32)
-
     # --- optional "after Type-1" diagnostics ---
     if getattr(cfg.type1, "debug_after_apply", False):
         analyze_type1_step(
@@ -503,6 +543,8 @@ def apply_type1_step(data, cfg, active_mask: np.ndarray, fill: int):
             fill=fill,
             tag="after"
         )
+
+    _recompute_derived_from_bxraw_inplace(data, cfg, active_mask)
 
     return data
 
@@ -609,7 +651,13 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
             input_pattern=input_name,
         )
 
+    # --- 2b) subtract fixed mod4 pedestal BEFORE any corrections/plots/fits ---
     if cfg.steps.restore_rates:
+
+        ped4 = getattr(cfg.afterglow, "fixed_pedestal_4", None)
+        if ped4 is not None:
+            _subtract_fixed_pedestal_mod4_inplace(data, ped4)
+
         data = restore_rates_step(data, cfg, active_mask)
 
     # plot after t2 but before t1
@@ -622,6 +670,9 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
 
     if cfg.steps.apply_type1:
         data = apply_type1_step(data, cfg, active_mask, fill)
+
+    # Recompute rates for safety
+    _recompute_derived_from_bxraw_inplace(data, cfg, active_mask)
 
     # plot the corrected rates
     # TODO likely will want to use a different flag

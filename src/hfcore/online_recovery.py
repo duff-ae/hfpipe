@@ -2,124 +2,167 @@
 
 from __future__ import annotations
 
-import numpy as np
+import logging
 from dataclasses import dataclass
 
+import numpy as np
+
 from .hd5schema import BX_LEN
-import logging
 
 log = logging.getLogger("hfpipe")
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
+
+try:
+    from cffi import FFI
+except Exception as e:
+    raise RuntimeError(
+        "online_recovery.py requires cffi. Install it with `pip install cffi`."
+    ) from e
+
+
+# ----------------------------------------------------------------------
+# C backend
+# ----------------------------------------------------------------------
+
+_ffi = FFI()
+_ffi.cdef(
+    """
+    void revert_afterglow(const int * activeBXMask, float * muHistPerBX, const float * HFSBR);
+    void subtract_pedestal(float * muHistPerBX, float * pedestal);
+    """
+)
+
+_C = _ffi.verify(
+    r"""
+    void revert_afterglow(const int * activeBXMask, float * muHistPerBX, const float * HFSBR) {
+        int ibx, jbx;
+        int bx_len = 3564;
+        int sbr_len = 3564;
+
+        for (ibx = bx_len; ibx-- > 0; ) {
+            if (activeBXMask[ibx] == 1) {
+                for (jbx = ibx + 1; jbx < ibx + sbr_len; jbx++) {
+                    if (jbx < bx_len) {
+                        muHistPerBX[jbx] += muHistPerBX[ibx] * HFSBR[jbx - ibx];
+                    } else {
+                        muHistPerBX[jbx - bx_len] += muHistPerBX[ibx] * HFSBR[jbx - ibx];
+                    }
+                }
+            }
+        }
+    }
+
+    void subtract_pedestal(float * muHistPerBX, float * pedestal) {
+        int nSample = 10;
+        int bx_len = 3564;
+        int ibx, jbx;
+
+        for (ibx = 0; ibx < 4; ibx++) {
+            pedestal[ibx] = 0.0f;
+            for (jbx = ibx; jbx < 4 * nSample; jbx += 4) {
+                pedestal[ibx] += muHistPerBX[3500 + jbx] / nSample;
+            }
+        }
+
+        for (ibx = 0; ibx < bx_len; ibx++) {
+            muHistPerBX[ibx] -= pedestal[ibx % 4];
+        }
+    }
+    """,
+    extra_compile_args=["-O3"],
+)
 
 
 @dataclass
 class OnlineStates:
     """
-    Container for reconstructed online-like states per row:
+    Reconstructed online-like states per row:
 
-      - mu_before : BX rates before ComputeAfterglow and pedestal
-      - mu_after  : BX rates after ComputeAfterglow, before SubtractPedestal
+      - mu_before : BX rates after revert_afterglow and pedestal subtraction
+      - mu_after  : BX rates after revert_afterglow, before pedestal subtraction
       - pedestal  : 4-element pedestal values (per row)
     """
-    mu_before: np.ndarray  # shape (T, BX_LEN)
-    mu_after: np.ndarray   # shape (T, BX_LEN)
-    pedestal: np.ndarray   # shape (T, 4)
+    mu_before: np.ndarray   # shape (T, BX_LEN)
+    mu_after: np.ndarray    # shape (T, BX_LEN)
+    pedestal: np.ndarray    # shape (T, 4)
 
 
 # ----------------------------------------------------------------------
-# 1) Exact implementation of online afterglow loops (forward & inverse)
+# Helpers
 # ----------------------------------------------------------------------
 
-def apply_afterglow_forward(
-    mu_before: np.ndarray,
-    hfsbr: np.ndarray,
-    active_mask: np.ndarray,
-) -> np.ndarray:
-    """
-    Exact Python reimplementation of the C++ ComputeAfterglow loop
-    on a single BX histogram.
-    """
-    mu_before = np.asarray(mu_before, dtype=np.float64)
-    hfsbr = np.asarray(hfsbr, dtype=np.float64)
-    active = np.asarray(active_mask, dtype=bool)
+def _validate_bx_hist_2d(name: str, arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.ndim != 2 or arr.shape[1] != BX_LEN:
+        raise ValueError(f"{name} has shape {arr.shape}, expected (T, {BX_LEN})")
+    return arr
 
-    if mu_before.shape[0] != BX_LEN:
-        raise ValueError(f"mu_before has length {mu_before.shape[0]}, expected {BX_LEN}")
-    if hfsbr.shape[0] < BX_LEN:
-        raise ValueError(
-            f"hfsbr length {hfsbr.shape[0]} is smaller than BX_LEN={BX_LEN}"
-        )
+
+def _validate_bx_hist_1d(name: str, arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.ndim != 1 or arr.shape[0] != BX_LEN:
+        raise ValueError(f"{name} has shape {arr.shape}, expected ({BX_LEN},)")
+    return arr
+
+
+def _validate_active_mask(active_mask: np.ndarray) -> np.ndarray:
+    active = np.asarray(active_mask, dtype=np.int32).ravel()
     if active.shape[0] != BX_LEN:
         raise ValueError(
             f"active_mask has length {active.shape[0]}, expected {BX_LEN}"
         )
-
-    N = BX_LEN
-    mu = mu_before.copy()
-
-    for ibx in range(N):
-        if not active[ibx]:
-            continue
-        src = mu[ibx]
-        if src == 0.0:
-            continue
-        for jbx in range(ibx + 1, ibx + N):
-            if jbx < N:
-                idx = jbx
-            else:
-                idx = jbx - N
-            diff = jbx - ibx
-            mu[idx] -= src * hfsbr[diff]
-
-    return mu.astype(np.float64)
+    return active
 
 
-def apply_afterglow_inverse(
-    mu_after: np.ndarray,
-    hfsbr: np.ndarray,
-    active_mask: np.ndarray,
-) -> np.ndarray:
-    """
-    Exact inverse of `apply_afterglow_forward` for a single BX histogram.
-
-    We reverse the outer loop and flip the sign of the update.
-    """
-    mu_after = np.asarray(mu_after, dtype=np.float64)
-    hfsbr = np.asarray(hfsbr, dtype=np.float64)
-    active = np.asarray(active_mask, dtype=bool)
-
-    if mu_after.shape[0] != BX_LEN:
-        raise ValueError(f"mu_after has length {mu_after.shape[0]}, expected {BX_LEN}")
+def _validate_hfsbr(hfsbr: np.ndarray) -> np.ndarray:
+    hfsbr = np.asarray(hfsbr, dtype=np.float32).ravel()
     if hfsbr.shape[0] < BX_LEN:
         raise ValueError(
             f"hfsbr length {hfsbr.shape[0]} is smaller than BX_LEN={BX_LEN}"
         )
-    if active.shape[0] != BX_LEN:
-        raise ValueError(
-            f"active_mask has length {active_mask.shape[0]}, expected {BX_LEN}"
-        )
+    return hfsbr
 
-    N = BX_LEN
-    mu = mu_after.copy()
 
-    for ibx in range(N - 1, -1, -1):
-        if not active[ibx]:
-            continue
-        src = mu[ibx]
-        if src == 0.0:
-            continue
-        for jbx in range(ibx + 1, ibx + N):
-            if jbx < N:
-                idx = jbx
-            else:
-                idx = jbx - N
-            diff = jbx - ibx
-            mu[idx] += src * hfsbr[diff]
+def _make_progress(iterable, *, enabled: bool, desc: str, total: int | None = None):
+    if enabled and tqdm is not None:
+        return tqdm(iterable, desc=desc, total=total)
+    return iterable
 
-    return mu.astype(np.float64)
+
+def _as_c_float32_1d(name: str, arr: np.ndarray) -> np.ndarray:
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
+    arr = _validate_bx_hist_1d(name, arr)
+    return arr
+
+
+def _call_revert_afterglow_inplace(
+    active_mask_i32: np.ndarray,
+    mu_hist_f32: np.ndarray,
+    hfsbr_f32: np.ndarray,
+) -> None:
+    _C.revert_afterglow(
+        _ffi.cast("const int *", _ffi.from_buffer(active_mask_i32)),
+        _ffi.cast("float *", _ffi.from_buffer(mu_hist_f32)),
+        _ffi.cast("const float *", _ffi.from_buffer(hfsbr_f32)),
+    )
+
+
+def _call_subtract_pedestal_inplace(
+    mu_hist_f32: np.ndarray,
+    pedestal_f32: np.ndarray,
+) -> None:
+    _C.subtract_pedestal(
+        _ffi.cast("float *", _ffi.from_buffer(mu_hist_f32)),
+        _ffi.cast("float *", _ffi.from_buffer(pedestal_f32)),
+    )
 
 
 # ----------------------------------------------------------------------
-# 2) Method A: reconstruction using extra tables
+# Method A: reconstruction using extra tables
 # ----------------------------------------------------------------------
 
 def reconstruct_from_tables_batch(
@@ -128,31 +171,24 @@ def reconstruct_from_tables_batch(
     afterglow_frac: np.ndarray,
 ) -> OnlineStates:
     """
-    Reconstruct online C++-like arrays using hfEtPedestal and hfafterglowfrac.
+    Reconstruct using hfEtPedestal and hfafterglowfrac.
 
-    C++ logic:
-
-        mu_after[bx]    = mu_before[bx] * hfafterglowfrac[bx]
-        bxraw_final[bx] = mu_after[bx] - pedestal[bx % 4]
-
-    Hence:
-
-        mu_after[bx]    = bxraw_final[bx] + pedestal[bx % 4]
-        mu_before[bx]   = (hfafterglowfrac[bx] > 0)
-                          ? mu_after[bx] / hfafterglowfrac[bx] : 0
+    Interpretation kept consistent with previous code:
+      - mu_after  = bxraw_final + pedestal
+      - mu_before = mu_after / afterglow_frac   where frac > 0
     """
     bxraw_final = np.asarray(bxraw_final, dtype=np.float64)
     pedestal_4 = np.asarray(pedestal_4, dtype=np.float64)
     afterglow_frac = np.asarray(afterglow_frac, dtype=np.float64)
 
-    T, nbx = bxraw_final.shape
-    if nbx != BX_LEN:
-        raise ValueError(f"bxraw_final has BX dimension {nbx}, expected {BX_LEN}")
+    bxraw_final = _validate_bx_hist_2d("bxraw_final", bxraw_final)
+
+    T, _ = bxraw_final.shape
     if pedestal_4.shape != (T, 4):
-        raise ValueError(f"pedestal_4 shape {pedestal_4.shape}, expected (T, 4)")
+        raise ValueError(f"pedestal_4 shape {pedestal_4.shape}, expected ({T}, 4)")
     if afterglow_frac.shape != (T, BX_LEN):
         raise ValueError(
-            f"afterglow_frac shape {afterglow_frac.shape}, expected (T, {BX_LEN})"
+            f"afterglow_frac shape {afterglow_frac.shape}, expected ({T}, {BX_LEN})"
         )
 
     idx_mod4 = np.arange(BX_LEN) % 4
@@ -175,310 +211,96 @@ def reconstruct_from_tables_batch(
 
 
 # ----------------------------------------------------------------------
-# 3) Method B: reconstruction via inverse online afterglow + pedestal fit
+# Method B: exact C-style online reconstruction
 # ----------------------------------------------------------------------
 
-def _precompute_pedestal_basis(
-    hfsbr: np.ndarray,
-    active_mask: np.ndarray,
-) -> np.ndarray:
-    """
-    Build basis vectors v_i = F^{-1}(q_i) in the online afterglow model,
-    where q_i is +1 on BX with (bx % 4 == i) in mu_after-space.
-    """
-    v_basis = np.zeros((4, BX_LEN), dtype=np.float64)
-
-    for i in range(4):
-        q = np.zeros(BX_LEN, dtype=np.float64)
-        q[i::4] = 1.0
-        v_basis[i] = apply_afterglow_inverse(q, hfsbr, active_mask)
-
-    return v_basis
-
-
-def recover_single_hist_online(
+def reconstruct_single_hist_online(
     bxraw_final: np.ndarray,
     hfsbr: np.ndarray,
     active_mask: np.ndarray,
-    v_basis: np.ndarray,
-    zero_bx: tuple[int, ...] = (3553, 3554, 3555, 3556, 3557),
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Approximate reconstruction of (mu_before, mu_after, pedestal[4])
-    for a single BX histogram using the inverse ONLINE afterglow algorithm.
+    Exact C-style sequence for one histogram:
 
-    We seek p[0..3] such that:
+      input histogram = bxraw_final
+      1) revert_afterglow(mu)
+      2) save mu_after = reverted histogram before pedestal subtraction
+      3) subtract_pedestal(mu, pedestal)
+      4) save mu_before = final corrected histogram
 
-        r(p) = F^{-1}(bxraw_final + P(p))
-
-    satisfies r(p)[z] ≈ 0 for z in zero_bx, with F^{-1} = apply_afterglow_inverse.
+    No fit, no zero_bx constraints, no iteration.
     """
-    y = np.asarray(bxraw_final, dtype=np.float64)
+    mu = _as_c_float32_1d("bxraw_final", bxraw_final).copy()
+    hfsbr_f32 = _validate_hfsbr(hfsbr)
+    active_i32 = _validate_active_mask(active_mask)
 
-    # r0 = F^{-1}(y)
-    r0 = apply_afterglow_inverse(y, hfsbr, active_mask)
-
-    zero_bx = np.asarray(zero_bx, dtype=int)
-    A = np.zeros((zero_bx.size, 4), dtype=np.float64)
-    b = np.zeros(zero_bx.size, dtype=np.float64)
-
-    for m, z in enumerate(zero_bx):
-        for i in range(4):
-            A[m, i] = v_basis[i, z]
-        b[m] = -r0[z]
-
-    p, *_ = np.linalg.lstsq(A, b, rcond=None)
-
-    ped_pattern = p[np.arange(BX_LEN) % 4]
-    mu_after = y + ped_pattern
-
-    mu_before = apply_afterglow_inverse(mu_after, hfsbr, active_mask)
-
-    return (
-        mu_before.astype(np.float32),
-        mu_after.astype(np.float32),
-        p.astype(np.float32),
+    _call_revert_afterglow_inplace(
+        active_mask_i32=active_i32,
+        mu_hist_f32=mu,
+        hfsbr_f32=hfsbr_f32,
     )
+
+    mu_after = mu.copy()
+    pedestal = np.zeros(4, dtype=np.float32)
+
+    _call_subtract_pedestal_inplace(
+        mu_hist_f32=mu,
+        pedestal_f32=pedestal,
+    )
+
+    mu_before = mu
+
+    return mu_before, mu_after, pedestal
 
 
 def reconstruct_from_online_batch(
     bxraw_final: np.ndarray,
     hfsbr: np.ndarray,
     active_mask: np.ndarray,
-    zero_bx: tuple[int, ...] = (3553, 3554, 3555, 3556, 3557),
+    zero_bx: tuple[int, ...] = (3553, 3554, 3555, 3556, 3557),  # kept for API compatibility
+    n_iter: int = 0,                                             # kept for API compatibility
+    step: float = 0.0,                                           # kept for API compatibility
+    show_progress: bool = False,
 ) -> OnlineStates:
     """
-    Батчевая реконструкция (mu_before, mu_after, pedestal[4]) по онлайн-алгоритму.
+    Batch wrapper around exact per-histogram C-style reconstruction.
 
-    Идея:
-
-      1) r0_all = F^{-1}(y_all)          — F^{-1} применён батчево;
-      2) v_basis[i,:] = F^{-1}(q_i)      — 4 базисных вектора для шаблона bx%4 == i;
-      3) A[m,i]    = v_basis[i, zero_bx[m]];
-         p_t       = argmin || A p + r0_t(zero_bx) ||^2
-         => p_t = - pinv(A) @ r0_t(zero_bx)
-      4) mu_before_t = r0_t + sum_i p_t[i] * v_basis[i,:]
-         mu_after_t  = y_t  + P(p_t), где P разворачивает ped по bx%4.
+    Note:
+      zero_bx / n_iter / step are ignored intentionally.
+      They are kept only so the existing pipeline call site does not break.
     """
     bxraw_final = np.asarray(bxraw_final, dtype=np.float32)
-    hfsbr = np.asarray(hfsbr, dtype=np.float64)
-    active_mask = np.asarray(active_mask, dtype=bool)
+    bxraw_final = _validate_bx_hist_2d("bxraw_final", bxraw_final)
 
-    T, N = bxraw_final.shape
-    if N != BX_LEN:
-        raise ValueError(f"bxraw_final has BX dimension {N}, expected {BX_LEN}")
-    if active_mask.shape[0] != N:
-        raise ValueError(
-            f"active_mask has length {active_mask.shape[0]}, expected {N}"
+    hfsbr = _validate_hfsbr(hfsbr)
+    active_mask = _validate_active_mask(active_mask)
+
+    T, _ = bxraw_final.shape
+
+    mu_before_all = np.zeros_like(bxraw_final, dtype=np.float32)
+    mu_after_all = np.zeros_like(bxraw_final, dtype=np.float32)
+    pedestal_all = np.zeros((T, 4), dtype=np.float32)
+
+    row_iter = _make_progress(
+        range(T),
+        enabled=show_progress,
+        desc="Online recovery (C-style)",
+        total=T,
+    )
+
+    for i in row_iter:
+        mu_before_i, mu_after_i, pedestal_i = reconstruct_single_hist_online(
+            bxraw_final=bxraw_final[i],
+            hfsbr=hfsbr,
+            active_mask=active_mask,
         )
 
-    zero_bx = np.asarray(zero_bx, dtype=int)
-    M = zero_bx.size
-
-    # --------------------------------------------------------------
-    # 1) F^{-1} для всех гистограмм сразу
-    # --------------------------------------------------------------
-    y_all = bxraw_final.astype(np.float64)
-    r0_all = apply_afterglow_inverse_batch(
-        mu_after_all=y_all,
-        hfsbr=hfsbr,
-        active_mask=active_mask,
-    )  # shape (T, N)
-
-    # --------------------------------------------------------------
-    # 2) F^{-1} для базисов q_i (4 шаблона по bx % 4)
-    # --------------------------------------------------------------
-    q_all = np.zeros((4, N), dtype=np.float64)
-    for i in range(4):
-        q_all[i, i::4] = 1.0
-
-    v_all = apply_afterglow_inverse_batch(
-        mu_after_all=q_all,
-        hfsbr=hfsbr,
-        active_mask=active_mask,
-    )  # shape (4, N)
-
-    # Матрица A[m, i] = v_i(zero_bx[m])
-    A = np.zeros((M, 4), dtype=np.float64)
-    for m, z in enumerate(zero_bx):
-        for i in range(4):
-            A[m, i] = v_all[i, z]
-
-    # Псевдообратная матрица
-    A_pinv = np.linalg.pinv(A)  # shape (4, M)
-
-    # --------------------------------------------------------------
-    # 3) Решаем для всех строк p_t сразу
-    # --------------------------------------------------------------
-    # r0_all_zero: shape (T, M)
-    r0_all_zero = r0_all[:, zero_bx]  # r0_t(zero_bx[m])
-
-    # B = - r0_all_zero^T: shape (M, T)
-    B = -r0_all_zero.T  # (M, T)
-
-    # P_all = A_pinv @ B: shape (4, T)
-    P_all = A_pinv @ B
-
-    # p_all: shape (T, 4)
-    p_all = P_all.T.astype(np.float32)
-
-    # --------------------------------------------------------------
-    # 4) mu_after = y + P(p), mu_before = r0 + P(v_basis)
-    # --------------------------------------------------------------
-    idx_mod4 = np.arange(N) % 4
-
-    # pedestal как паттерн по BX: shape (T, N)
-    ped_pattern = np.zeros((T, N), dtype=np.float64)
-    for i in range(4):
-        mask = (idx_mod4 == i)
-        if not np.any(mask):
-            continue
-        ped_pattern[:, mask] = p_all[:, i][:, None]
-
-    mu_after_all = (y_all + ped_pattern).astype(np.float32)
-
-    # mu_before_all = r0_all + P_all @ v_all
-    # P_all: (T,4), v_all: (4,N) -> (T,N)
-    mu_before_all = (r0_all + P_all.T @ v_all).astype(np.float32)
+        mu_before_all[i] = mu_before_i
+        mu_after_all[i] = mu_after_i
+        pedestal_all[i] = pedestal_i
 
     return OnlineStates(
         mu_before=mu_before_all,
         mu_after=mu_after_all,
-        pedestal=p_all,
+        pedestal=pedestal_all,
     )
-
-
-
-# ----------------------------------------------------------------------
-# 4) Debug utilities: pulls / differences between two methods
-# ----------------------------------------------------------------------
-
-def compute_pulls(
-    ref: np.ndarray,
-    test: np.ndarray,
-    eps: float = 1e-9,
-) -> np.ndarray:
-    """
-    Simple pull definition:
-
-        pull = (test - ref) / sqrt(|ref| + eps)
-    """
-    ref = np.asarray(ref, dtype=np.float64)
-    test = np.asarray(test, dtype=np.float64)
-
-    return (test - ref) / np.sqrt(np.abs(ref) + eps)
-
-
-def compare_recovery_methods(
-    states_tables: OnlineStates,
-    states_online: OnlineStates,
-) -> dict[str, np.ndarray]:
-    """
-    Compare two recovery methods:
-
-      - 'tables' : exact reconstruction using hfEtPedestal + hfafterglowfrac
-      - 'online' : approximate reconstruction using inverse ComputeAfterglow
-                   and pedestal fit from zero-BX constraints.
-    """
-    if states_tables.mu_before.shape != states_online.mu_before.shape:
-        raise ValueError("mu_before shapes differ between methods")
-    if states_tables.mu_after.shape != states_online.mu_after.shape:
-        raise ValueError("mu_after shapes differ between methods")
-    if states_tables.pedestal.shape != states_online.pedestal.shape:
-        raise ValueError("pedestal shapes differ between methods")
-
-    pull_before = compute_pulls(
-        ref=states_tables.mu_before,
-        test=states_online.mu_before,
-    ).astype(np.float32)
-
-    pull_after = compute_pulls(
-        ref=states_tables.mu_after,
-        test=states_online.mu_after,
-    ).astype(np.float32)
-
-    diff_ped = (states_online.pedestal - states_tables.pedestal).astype(np.float32)
-
-    return {
-        "pull_mu_before": pull_before,
-        "pull_mu_after": pull_after,
-        "diff_pedestal": diff_ped,
-    }
-
-def _compute_max_diff(hfsbr: np.ndarray, tol: float = 1e-12) -> int:
-    """
-    Эффективная длина ядра afterglow: максимальный d,
-    для которого |HFSBR[d]| > tol.
-    """
-    hfsbr = np.asarray(hfsbr, dtype=np.float64)
-    nonzero = np.where(np.abs(hfsbr) > tol)[0]
-    if nonzero.size == 0:
-        return 0
-    return int(nonzero.max())
-
-def apply_afterglow_inverse_batch(
-    mu_after_all: np.ndarray,
-    hfsbr: np.ndarray,
-    active_mask: np.ndarray,
-    tol: float = 1e-12,
-) -> np.ndarray:
-    """
-    Батчевая версия онлайн-инверсии:
-
-      mu_before_all = F^{-1}(mu_after_all)
-
-    mu_after_all : shape (T, BX_LEN)
-    """
-    mu = np.asarray(mu_after_all, dtype=np.float64).copy()
-    hfsbr = np.asarray(hfsbr, dtype=np.float64)
-    active = np.asarray(active_mask, dtype=bool)
-
-    T, N = mu.shape
-    if N != BX_LEN:
-        raise ValueError(f"apply_afterglow_inverse_batch: N={N}, expected {BX_LEN}")
-    if active.shape[0] != N:
-        raise ValueError(f"active_mask length {active.shape[0]} != {N}")
-
-    max_diff = _compute_max_diff(hfsbr, tol=tol)
-    if max_diff <= 0:
-        # ядро нулевое -> F ~ Identity
-        return mu
-
-    # Ограничиваем длину ядра по BX
-    max_diff = min(max_diff, N - 1)
-
-    log.info(
-        "[online_recovery] apply_afterglow_inverse_batch: T=%d, N=%d, max_diff=%d",
-        T, N, max_diff,
-    )
-
-    # Алгоритм: то же, что в apply_afterglow_inverse, но сразу по всем T.
-    for ibx in range(N - 1, -1, -1):
-        if not active[ibx]:
-            continue
-
-        src = mu[:, ibx]        # shape (T,)
-        if np.allclose(src, 0.0):
-            continue
-
-        max_j = ibx + max_diff
-
-        # Сегмент без wrap-around: j in [ibx+1, min(N-1, max_j)]
-        j1_start = ibx + 1
-        if j1_start <= N - 1:
-            j1_end = min(N - 1, max_j)
-            # бежим по diff, их обычно немного (max_diff ~ десятки)
-            for j in range(j1_start, j1_end + 1):
-                d = j - ibx
-                mu[:, j] += src * hfsbr[d]
-
-        # Сегмент с wrap-around, если max_j >= N
-        if max_j >= N:
-            j2_start = N
-            j2_end = max_j
-            for j in range(j2_start, j2_end + 1):
-                d = j - ibx
-                idx = j - N
-                mu[:, idx] += src * hfsbr[d]
-
-    return mu.astype(np.float64)

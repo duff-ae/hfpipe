@@ -2,12 +2,13 @@ io:
   # Input HFET hd5 files, one file per fill
   # Expected path: /cephfs/brilshare/alshevel/hf_origin/hfet/25/<fill>/<fill>_*.hd5
   input_dir: "/cephfs/brilshare/alshevel/hf_origin/hfet/25"
+  #input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
   beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
   input_pattern: "{fill}/{fill}_*.hd5"
 
   # Output files, to avoid overwriting the old version
   # Resulting path: /cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_test/<fill>/<fill>.hd5
-  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_test"
+  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/25"
   output_pattern: "{fill}/{fill}.hd5"
 
   # HDF5 node / key with the HFET table
@@ -18,17 +19,17 @@ io:
   active_mask_pattern: "/cephfs/brilshare/alshevel/hf_masks/activeBXMask_fill{fill}.npy"
 
   # Directory where Type-1 diagnostic plots (etc.) are stored
-  type1_dir: "/eos/home-a/alshevel/hf_type_plots"
+  type1_dir: "/eos/home-a/alshevel/hf_plots"
 
 steps:
-  online_recovery: true
-  restore_rates: false
-  compute_type1: false
-  apply_type1: false
+  online_recovery: false
+  restore_rates: true
+  compute_type1: true
+  apply_type1: true
 
 online_recovery:
-  method: "online"       # "online" or "tables"
-  debug_compare: true
+  method: "tables"       # "online" or "tables"
+  debug_compare: false
 
   pedestal_node: "hfEtPedestal"
   afterglow_node: "hfafterglowfrac"
@@ -44,19 +45,18 @@ afterglow:
   # Regularization strengths for the LSQ inversion
   lambda_reg: 0.01
   lambda_nonactive: 0.05
-  
   n_jobs: 16
-
-  # From your note: sigvis = 3170.19
+  # From your note: sigvis = 3113
   # Conversion example: bx = bxraw * 11245.6 / sigvis
-  sigvis: 3170.19
+  sigvis: 3178
+  fixed_pedestal_4: [0.01281162, 0.01306513, 0.01220016, 0.01219646]
 
 type1:
   # Offsets (in BX) between the main bunch and the tail to be fitted
   offsets: [1, 2, 3, 4]
 
   # Minimum SBIL for including a point in the Type-1 fit
-  sbil_min: 0.1
+  sbil_min: 0.5
 
   # Whether to produce Type-1 summary plots
   make_plots: true
@@ -69,4 +69,4 @@ type1:
 
 fills:
   # For testing: run over a single fill. Later this can be replaced by a list of stable fills.
-  - 11164
+  - 10826

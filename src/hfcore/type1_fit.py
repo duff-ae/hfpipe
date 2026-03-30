@@ -83,12 +83,11 @@ def _collect_type1_points(
         y_after = hist[afterglow_indices] # mu_afterglow
 
         # avoid division by zero
-        mask_nonzero = y > 0.0
-        if not np.any(mask_nonzero):
-            continue
+        mask_valid = y > sbil_min
 
-        y = y[mask_nonzero]
-        y_after = y_after[mask_nonzero]
+        y = y[mask_valid]
+        y_after = y_after[mask_valid]
+
         frac = y_after / y
 
         y_vals.append(y)
@@ -459,7 +458,7 @@ def analyze_type1_step(data, cfg, active_mask, fill: int, tag: str = "before"):
         aft = hists[:, afterglow_idx]       # (T_sel, Npairs)
 
         # protect against division by zero
-        valid = coll > 0.0
+        valid = np.isfinite(coll) & np.isfinite(aft) & (coll > sbil_min)
         coll = coll[valid]
         aft = aft[valid]
 
