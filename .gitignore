@@ -4,6 +4,10 @@ data/**
 out/**
 *.png
 
+# test scripts
+run_tests.sh
+replace_afterglow.sh
+
 # Python cache
 .venv*/
 __pycache__/
