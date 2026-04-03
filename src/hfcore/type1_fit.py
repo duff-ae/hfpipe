@@ -20,6 +20,10 @@ log = logging.getLogger("hfpipe.type1_fit")
 # Helpers for Type-1 coefficient extraction
 # ---------------------------------------------------------------------------
 
+def _downsample(arr, max_len=5000):
+    step = max(1, len(arr) // max_len)
+    return arr[::step]
+
 def _collect_type1_points(
     bxraw: np.ndarray,
     avg: np.ndarray,
@@ -41,9 +45,9 @@ def _collect_type1_points(
         and active_mask[bx + dt] == 0 for all dt = 1..offset
         (following 'offset' BX are non-colliding).
     """
-    active_mask = np.asarray(active_mask, dtype=np.int32)
-    bxraw = np.asarray(bxraw, dtype=np.float64)
-    avg = np.asarray(avg, dtype=np.float64)
+    #active_mask = np.asarray(active_mask, dtype=np.int32)
+    #bxraw = np.asarray(bxraw, dtype=np.float64)
+    #avg = np.asarray(avg, dtype=np.float64)
 
     assert bxraw.shape[1] == BX_LEN, "bxraw must be (T, BX_LEN)"
 
@@ -162,8 +166,8 @@ def compute_type1_coeffs(
       index t corresponds to BX + t, i.e. t=1 -> BX+1, etc.
       t=0 is kept zero (no subtraction for the colliding BX itself).
     """
-    bxraw = np.array(bxraw, dtype=np.float64)
-    avg = np.asarray(avg, dtype=np.float64)
+    bxraw = np.array(bxraw[::5,:], dtype=np.float64)
+    avg = np.asarray(avg[::5], dtype=np.float64)
     active_mask = np.asarray(active_mask, dtype=np.int32)
 
     assert bxraw.ndim == 2 and bxraw.shape[1] == BX_LEN, "bxraw must be (T, BX_LEN)"
@@ -441,7 +445,7 @@ def analyze_type1_step(data, cfg, active_mask, fill: int, tag: str = "before"):
             )
             continue
 
-        hists = bxraw[time_mask, :]   # shape (T_selected, BX_LEN)
+        hists = bxraw[time_mask, :] * 11245.6/cfg.afterglow.sigvis   # shape (T_selected, BX_LEN)
 
         # --- select BX pairs ---
         colliding_idx, afterglow_idx = _select_type1_pairs(active_mask, offset)
@@ -553,8 +557,8 @@ def analyze_type1_step(data, cfg, active_mask, fill: int, tag: str = "before"):
             fig = plt.figure(figsize=(7, 5))
             # scatter
             plt.plot(
-                bx_value,
-                bx_type1,
+                _downsample(bx_value),
+                _downsample(bx_type1),
                 ".",
                 alpha=0.2,
                 label=f"Type-1 fraction for BX[i+{offset}]",

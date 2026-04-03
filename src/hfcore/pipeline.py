@@ -8,6 +8,10 @@ import logging
 import h5py
 import re
 import copy
+import math
+import traceback
+from tqdm import tqdm
+from joblib import Parallel, delayed
 
 from .decorators import log_step, timeit
 from .io import load_hd5_to_arrays, arrays_to_rows, save_to_hd5
@@ -15,6 +19,7 @@ from .hd5schema import BX_LEN
 from .afterglow_lsq import build_afterglow_solver_from_file
 from .type1_fit import compute_type1_coeffs, save_type1_coeffs, analyze_type1_step
 from .type1_apply import apply_type1_batch
+from .bunch_train import compute_bunch_train_coeffs, save_bunch_train_coeffs, analyze_bunch_train_step, apply_bunch_train_batch
 from .online_recovery import reconstruct_from_tables_batch, reconstruct_from_online_batch
 from .plotter import plot_hist_bx, plot_lumi_comparison, plot_residuals, plot_lasers
 
@@ -125,6 +130,46 @@ def _recompute_derived_from_bxraw_inplace(
     # avg = scaled sum over active BX (lumi-space)
     data["avg"] = (avgraw * scale).astype(np.float32, copy=False)
 
+
+# ---------------------------------------------------------------------------
+# Helpers for merging tables
+# ---------------------------------------------------------------------------
+
+# for double checking if a column is all unique values
+# sanity check used before merging two tables on a column
+def _is_unique_columns(cols):
+    stacked = np.column_stack(cols)
+    return np.unique(stacked, axis=0).shape[0] == stacked.shape[0]
+
+# for merging one column from a dictionary into another
+# useful for getting the pedestal information
+def _inner_merge_one_column(left, right, on, right_col, new_col_name):
+   # Build structured arrays for keys
+    left_keys = np.core.records.fromarrays([left[c] for c in on], names=",".join(on))
+    right_keys = np.core.records.fromarrays([right[c] for c in on], names=",".join(on))
+
+    # Sort right keys for fast lookup
+    order = np.argsort(right_keys)
+    right_keys_sorted = right_keys[order]
+    right_vals_sorted = right[right_col][order]
+
+    # Find matches
+    idx = np.searchsorted(right_keys_sorted, left_keys)
+    valid = idx < right_keys_sorted.size
+    mask = np.zeros_like(valid, dtype=bool)
+    mask[valid] = right_keys_sorted[idx[valid]] == left_keys[valid]
+
+    # Build merged dict
+    merged = {}
+
+    for k, v in left.items():
+        merged[k] = v[mask]
+
+    merged[new_col_name] = right_vals_sorted[idx[mask]]
+
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Helpers for Type-1 paths
 # ---------------------------------------------------------------------------
@@ -219,6 +264,8 @@ def _load_hfsbr_for_online(cfg: PipelineConfig, fill: int) -> np.ndarray:
         f"Please adapt _load_hfsbr_for_online."
     )
 
+@log_step("online_recovery")
+@timeit("online_recovery")
 def recover_bxraw_step(
     data: dict,
     cfg: PipelineConfig,
@@ -232,10 +279,25 @@ def recover_bxraw_step(
     use_tables = (rec_cfg.method == "tables")
     use_online = (rec_cfg.method == "online")
 
-    states_tables = None
-    states_online = None
+        
+    if use_online:
+        hfsbr = _load_hfsbr_for_online(cfg, fill)
+        linear = np.array(rec_cfg.linear_type1)
+        quad = np.array(rec_cfg.quad_type1)
 
-    if use_tables:
+        states_online = reconstruct_from_online_batch(
+            bxraw_final=bxraw_final,
+            hfsbr=hfsbr,
+            linear=linear,
+            quad=quad,
+            pedestal=(data["pedestal"] if cfg.online_recovery.pedestal_node is not None else None),
+            active_mask=active_mask,
+            zero_bx=(3553, 3554, 3555, 3556, 3557),
+            show_progress=True,
+        )
+
+        data["bxraw"] = states_online
+    elif use_tables:
         ped_node = rec_cfg.pedestal_node
         aft_node = rec_cfg.afterglow_node
 
@@ -262,30 +324,19 @@ def recover_bxraw_step(
             colname="bxraw",
         ).astype(np.float32)
 
+
         states_tables = reconstruct_from_tables_batch(
             bxraw_final=bxraw_final,
             pedestal_4=ped_4,
             afterglow_frac=aft_frac,
         )
 
-    if use_online:
-        hfsbr = _load_hfsbr_for_online(cfg, fill)
-        states_online = reconstruct_from_online_batch(
-            bxraw_final=bxraw_final,
-            hfsbr=hfsbr,
-            active_mask=active_mask,
-            zero_bx=(3553, 3554, 3555, 3556, 3557),
-            show_progress=True,
-        )
-
-    if use_tables:
-        data["bxraw"] = states_tables.mu_before
+        data["bxraw"] = states_tables
     else:
-        if states_online is None:
-            raise RuntimeError("online_recovery: states_online is None, check config")
-        data["bxraw"] = states_online.mu_before
+        raise RuntimeError("online_recovery: states_online is None, check config")
 
     return data
+
 
 # ---------------------------------------------------------------------------
 # Step 1: afterglow / recovery of mu_true
@@ -548,6 +599,136 @@ def apply_type1_step(data, cfg, active_mask: np.ndarray, fill: int):
 
     return data
 
+# ---------------------------------------------------------------------------
+# Step 4: bunch train corrections
+# ---------------------------------------------------------------------------
+
+@log_step("compute_bunch_train_step")
+@timeit("compute_bunch_train_step")
+def compute_bunch_train_step(data, cfg, active_mask: np.ndarray, fill: int):
+    """
+    Pipeline step: estimate bunch train coefficients for a given fill.
+    """
+    if "bxraw" not in data:
+        raise KeyError("compute_bunch_train_step: 'bxraw' not found in data")
+    if "bxraw_ref" not in data:
+        raise KeyError("compute_bunch_train_step: 'bxraw_ref' not found in data")
+
+    bxraw = np.asarray(data["bxraw"], dtype=np.float64)
+    bxraw_ref = np.asarray(data["bxraw_ref"], dtype=np.float64)
+
+    # --- SBIL / avg for Type-1 fit ---
+    if "sbil" in data:
+        avg = np.asarray(data["sbil"], dtype=np.float64)
+    elif "avg" in data:
+        avg = np.asarray(data["avg"], dtype=np.float64)
+    else:
+        # fallback: compute SBIL from bxraw and active mask
+        mask = np.asarray(active_mask, dtype=np.int32)
+        n_active = int(mask.sum())
+        if n_active == 0:
+            raise ValueError("compute_bunch_train_step: active_mask has zero active BX")
+        avg = (bxraw * mask[None, :]).sum(axis=1) / float(n_active)
+
+    order = int(getattr(cfg.bunch_train, "order", 1))
+    sbil_min = float(getattr(cfg.bunch_train, "sbil_min", 0.1))
+
+    # --- compute Type-1 coefficients ---
+    p = compute_bunch_train_coeffs(
+        bxraw=bxraw,
+        bxraw_ref=bxraw_ref,
+        avg=avg,
+        active_mask=active_mask,
+        order=order,
+        sbil_min=sbil_min,
+    )
+
+    # --- where to save ---
+    type1_dir = _get_type1_dir(cfg)
+
+    path = save_bunch_train_coeffs(
+        fill=fill,
+        output_dir=type1_dir,
+        coeffs=p,
+    )
+
+    log.info(
+        "[compute_bunch_train_step] fill %d: Type-1 coeffs saved to %s",
+        fill,
+        path,
+    )
+
+    # --- optional debug / analysis block ---
+    # This is the "before Type-1 subtraction" diagnostic.
+    if getattr(cfg.bunch_train, "make_plots", False):
+        analyze_bunch_train_step(
+            data=data,
+            cfg=cfg,
+            active_mask=active_mask,
+            fill=fill,
+            tag="before"
+        )
+
+    return data
+
+@log_step("apply_bunch_train_step")
+@timeit("apply_bunch_train_step")
+def apply_bunch_train_step(data, cfg, active_mask: np.ndarray, fill: int):
+    """
+    Pipeline step: apply bunch train subtraction to bxraw.
+    """
+    if "bxraw" not in data:
+        raise KeyError("apply_bunch_train_step: 'bxraw' not found in data")
+
+    bxraw = np.asarray(data["bxraw"], dtype=np.float64)
+
+    # --- where to find bunch train coefficients ---
+    type1_dir = _get_type1_dir(cfg)
+    coeff_path = os.path.join(type1_dir, f"bunch_train_coeffs_fill{fill}.h5")
+    if not os.path.exists(coeff_path):
+        raise FileNotFoundError(
+            f"apply_bunch_train_step: Bunch Train coeff file not found: {coeff_path}"
+        )
+
+    # --- read coefficients ---
+    with h5py.File(coeff_path, "r") as h5:
+        p = h5["coeffs"][:]
+
+    log.info(
+        "[apply_bunch_train_step] fill %d: loaded Bunch Train coeffs from %s",
+        fill,
+        coeff_path,
+    )
+
+    # --- apply bunch_train subtraction in mu-space ---
+    corrected_mu = apply_bunch_train_batch(
+        bxraw=bxraw,
+        active_mask=active_mask,
+        coeffs=p,
+    ).astype(np.float32)
+
+    data["bxraw"] = corrected_mu
+
+    # --- recompute bx and avg AFTER bunch train subtraction ---
+    sigvis = getattr(cfg.afterglow, "sigvis", None)
+    scale = 1.0 if not sigvis else 11245.6 / float(sigvis)
+
+    bx_lumi = (corrected_mu * scale).astype(np.float32, copy=False)
+    data["bx"] = bx_lumi
+    data["avg"] = bx_lumi.mean(axis=1).astype(np.float32)
+
+    # --- optional "after bunch train" diagnostics ---
+    if getattr(cfg.bunch_train, "make_plots", False):
+        analyze_bunch_train_step(
+            data=data,
+            cfg=cfg,
+            active_mask=active_mask,
+            fill=fill,
+            tag="after"
+        )
+
+    return data
+
 
 # ---------------------------------------------------------------------------
 # Main entry point for a single fill
@@ -584,8 +765,41 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
     # --- 1) load input data (may contain multiple files and multiple fills) ---
     data = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.io.node)
     
-    # TODO beam table is missing from fill???
-    #beam = load_hd5_to_arrays(cfg.io.beam_dir, input_name, node='beam')
+    # columns used for merging two tables together
+    merge_cols = ['fillnum', 'runnum', 'lsnum', 'nbnum']
+
+    # add the pedestal data (if needed)
+    if cfg.online_recovery.pedestal_node is not None and cfg.steps.revert_online:
+        ped = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.online_recovery.pedestal_node)
+
+        if data["timestampsec"].size != ped["timestampsec"].size:
+            log.warning(
+                "[run_fill] fill %d: pedestal data not present for %d entries. Dropping rows...",
+                fill,
+                data["timestampsec"].size - ped["timestampsec"].size,
+            )
+
+        if not _is_unique_columns([ped[c] for c in merge_cols]):
+            raise ValueError(f"{merge_cols} values are not unique. Choose another column to merge on.")
+
+        data = _inner_merge_one_column(data, ped, merge_cols, "bxraw", "pedestal")
+    
+    # add the reference data for the bunch train correction (if needed)
+    if cfg.steps.bunch_train:
+        ref = load_hd5_to_arrays(cfg.bunch_train.linear_reference, cfg.bunch_train.input_pattern.format(fill=fill), node=cfg.bunch_train.node)
+
+        if data["timestampsec"].size != ref["timestampsec"].size:
+            log.warning(
+                "[run_fill] fill %d: reference luminometer data not present for %d entries. Dropping rows...",
+                fill,
+                data["timestampsec"].size - ref["timestampsec"].size,
+            )
+
+        if not _is_unique_columns([ref[c] for c in merge_cols]):
+            raise ValueError(f"{merge_cols} values are not unique. Choose another column to merge on.")
+
+        data = _inner_merge_one_column(data, ref, merge_cols, "bxraw", "bxraw_ref")
+    
 
     # --- 1a) keep only rows corresponding to the current fill ---
     fill_arr = data.get("fillnum", None)
@@ -632,17 +846,19 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
             fill,
         )
 
-    # plot the uncorrected rates
-    # TODO likely will want to use a different flag
-    # TODO also need to tell the plot which year this is
-    if cfg.type1.make_plots:
-        plot_hist_bx(data, cfg, fill, 'Uncorr. Luminosity')
+    # filter out any nans TODO is this physically correct?
+    if not np.all(np.isfinite(data['bxraw'])):
+        log.warning(
+            "[run_fill] fill %d: nan values found in data. Replacing with 0...",
+            fill,
+        )
+        np.nan_to_num(data['bxraw'], copy=False, posinf=0.0, neginf=0.0)
 
-        # save the uncorrected rates for later comparison
-        data_origin = copy.deepcopy(data)
 
     # --- 2) pipeline steps ---
     if cfg.steps.online_recovery:
+        if cfg.type1.make_plots:
+            plot_hist_bx(data, cfg, fill, 'Online Luminosity')
         data = recover_bxraw_step(
             data=data,
             cfg=cfg,
@@ -650,6 +866,14 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
             fill=fill,
             input_pattern=input_name,
         )
+
+    # plot the uncorrected rates
+    # TODO also need to tell the plot which year this is
+    if cfg.type1.make_plots:
+        plot_hist_bx(data, cfg, fill, 'Uncorr. Luminosity')
+
+        # save the uncorrected rates for later comparison
+        data_origin = copy.deepcopy(data)
 
     # --- 2b) subtract fixed mod4 pedestal BEFORE any corrections/plots/fits ---
     if cfg.steps.restore_rates:
@@ -660,10 +884,10 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
 
         data = restore_rates_step(data, cfg, active_mask)
 
-    # plot after t2 but before t1
-    if cfg.type1.make_plots:
-        plot_hist_bx(data, cfg, fill, 'T2 Corr. Luminosity')
-        plot_residuals(data, cfg, active_mask, fill, 't2_corr')
+        # plot after t2 but before t1
+        if cfg.type1.make_plots:
+            plot_hist_bx(data, cfg, fill, 'T2 Corr. Luminosity')
+            plot_residuals(data, cfg, active_mask, fill, 't2_corr')
     
     if cfg.steps.compute_type1:
         data = compute_type1_step(data, cfg, active_mask, fill)
@@ -671,16 +895,26 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
     if cfg.steps.apply_type1:
         data = apply_type1_step(data, cfg, active_mask, fill)
 
-    # Recompute rates for safety
+        # plot the corrected rates
+        # TODO also need to tell the plot which year this is
+        if cfg.type1.make_plots:
+            plot_hist_bx(data, cfg, fill, 'T2 and T1 Corr. Luminosity')
+            plot_residuals(data, cfg, active_mask, fill, 't1_t2_corr')
+    
+    if cfg.steps.bunch_train:
+        data = compute_bunch_train_step(data, cfg, active_mask, fill)
+        data = apply_bunch_train_step(data, cfg, active_mask, fill)
+
+    # recompute derived quantities (lumi, avg_raw, etc.) for safety
     _recompute_derived_from_bxraw_inplace(data, cfg, active_mask)
 
     # plot the corrected rates
     # TODO likely will want to use a different flag
     # TODO also need to tell the plot which year this is
     if cfg.type1.make_plots:
-        plot_hist_bx(data, cfg, fill, 'T2 and T1 Corr. Luminosity')
-        plot_lumi_comparison(data, data_origin, cfg, active_mask, fill)
+        plot_hist_bx(data, cfg, fill, 'Full Corr. Luminosity')
         plot_residuals(data, cfg, active_mask, fill, 'full_corr')
+        plot_lumi_comparison(data, data_origin, cfg, active_mask, fill)
         plot_lasers(data, data_origin, cfg, active_mask, fill)
 
     # --- 3) save result ---
@@ -713,6 +947,7 @@ def run_many_fills(cfg: PipelineConfig, fills: list[int]):
             # Any other exception — also mark as failed and continue.
             print(f"[ERROR] Fill {fill} failed with exception:")
             print(e)
+            print(traceback.format_exc())
             failed.append(fill)
 
     # Final summary

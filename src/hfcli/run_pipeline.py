@@ -95,6 +95,9 @@ def main():
     cfg = load_config(args.config)
 
     fills = parse_fills(args.fills)
+
+    if fills is None:
+        fills = cfg.fills
     
     if fills is None:
         # fills не указан → автоматически берём все филы из input_dir

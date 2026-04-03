@@ -1,0 +1,164 @@
+# online configuration valid between the dates of Apr 24, 2024 and Nov 05, 2024
+
+io:
+  # Input HFET hd5 files, one file per fill
+  #input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2024/physics"
+  input_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/24_uncorr"
+  beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2024/physics"
+  #input_pattern: "{fill}/{fill}_*.hd5"
+  input_pattern: "{fill}/{fill}.hd5"
+
+  # Output files, to avoid overwriting the old version
+  output_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/24"
+  output_pattern: "{fill}/{fill}.hd5"
+
+  # HDF5 node / key with the HF table
+  node: "hfoclumi"
+
+  # Precomputed active BX mask (shape=(3564,), dtype=int)
+  # Can be produced once from the beam hd5
+  active_mask_pattern: "/cephfs/brilshare/alshevel/hf_masks/activeBXMask_fill{fill}.npy"
+
+  # Directory where Type-1 diagnostic plots (etc.) are stored
+  type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/OC/24"
+
+steps:
+  revert_online: false
+  restore_rates: true
+  compute_type1: true
+  apply_type1:   true
+  bunch_train:   true
+
+afterglow:
+
+  # BX indices to hard-clean (mu_true = 0) – analogue of BX_TO_CLEAN
+  bx_to_clean: [3488, 3489, 3490, 3491, 3553, 3554, 3555, 3556, 3557]
+  
+  hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfoc_10843.txt"
+  
+  # Regularization strengths for the LSQ inversion
+  lambda_reg: 0.01
+  lambda_nonactive: 0.05
+  
+  n_jobs: 16
+
+  # Conversion example: bx = bxraw * 11245.6 / sigvis
+  sigvis: 931.3
+
+type1:
+  # Offsets (in BX) between the main bunch and the tail to be fitted
+  offsets: [1, 2, 3, 4]
+
+  # Minimum SBIL for including a point in the Type-1 fit
+  sbil_min: 0.1
+
+  # Whether to produce Type-1 summary plots
+  make_plots: true
+
+  debug: true             # draw "before" Type-1 plots directly in compute_type1_step
+  debug_after_apply: true # draw "after" Type-1 plots in apply_type1_step
+
+  # Do not store heavy intermediate type1_{offset}.h5 files
+  save_hd5: false
+
+bunch_train:
+  # location of data to use as a linear reference for the bunch train effect
+  linear_reference: "/eos/cms/store/group/dpg_bril/comm_bril/2024/reprocessed/hfet_tmp"
+  input_pattern: "{fill}/{fill}_*.hd5"
+  node: "hfetlumi"
+  #linear_reference: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
+  #input_pattern: "{fill}/{fill}_*.hd5"
+  #node: "bcm1futcalumi"
+
+  # order of the poly fit to apply
+  order: 3
+  
+  # Minimum SBIL for including a point in the fit
+  sbil_min: 0.1
+
+  make_plots: True
+  save_hd5: False
+
+online:
+  # for restoring rates from online
+  hfsbr: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Apr24_24.txt"
+
+  # online type 1
+  # these were in effect from Apr 24, 2024 to Nov 05, 2024
+  linear_type1: [0.00115058, 9.62720752e-05, -2.38976234e-05]
+  quad_type1: [0.00118399, 9.97966854e-05, 7.25134025e-05]
+
+  # online pedestal
+  # set to null if there is no online pedestal
+  pedestal_table: null
+
+fills:
+  - 9562
+  - 9564
+  - 9565
+  - 9566
+  - 9567
+  - 9568
+  - 9569
+  - 9570
+  - 9573
+  - 9574
+  - 9575
+  - 9579
+  - 9585
+  - 9593
+  - 9594
+  - 9602
+  - 9603
+  - 9604
+  - 9605
+  - 9606
+  - 9608
+  - 9609
+  - 9610
+  - 9611
+  - 9614
+  - 9618
+  - 9626
+  - 9639
+  - 9641
+  - 9643
+  - 9644
+  - 9651
+  - 9653
+  - 9654
+  - 9659
+  - 9661
+  - 9662
+  - 9663
+  - 9664
+  - 9666
+  - 9667
+  - 9670
+  - 9672
+  - 9674
+  - 9677
+  - 9680
+  - 9683
+  - 9684
+  - 9686
+  - 9687
+  - 9691
+  - 9694
+  - 9696
+  - 9700
+  - 9701
+  - 9705
+  - 9707
+  - 9708
+  - 9717
+  - 9801
+  - 9803
+  - 9804
+  - 9806
+  - 9808
+  - 9810
+  - 9812
+  - 9813
+  - 9816
+  - 9819

@@ -8,19 +8,8 @@ import yaml
 
 
 @dataclass
-class OnlineRecoveryConfig:
-    method: str = "online"          # "online" or "tables"
-
-    pedestal_node: str = "hfEtPedestal"
-    afterglow_node: str = "hfafterglowfrac"
-
-    # HFSBR для инверсии онлайн-алгоритма.
-    # Если None -> fallback на afterglow.hfsbr_pattern
-    hfsbr_pattern: str | None = None
-
-@dataclass
 class StepsConfig:
-
+    # 0) revert online corrections
     online_recovery: bool = False
 
     # 1) восстановление истинных bxraw (afterglow LSQ)
@@ -35,6 +24,9 @@ class StepsConfig:
     # 4) вычитание Type1 из bxraw (когда допишем apply_type1_step)
     apply_type1: bool = False
 
+    # 5) fit and apply bunch train corrections
+    bunch_train: bool = False
+
 
 @dataclass
 class IOConfig:
@@ -46,7 +38,6 @@ class IOConfig:
     node: str = "hfetlumi"
     active_mask_pattern: str = ""  # "/path/to/activeBXMask_fill{fill}.npy"
     type1_dir: Optional[str] = None
-
 
 @dataclass
 class AfterglowConfig:
@@ -78,6 +69,32 @@ class Type1Config:
     debug_after_apply: bool = False
     save_hd5: bool = False
 
+
+@dataclass
+class BunchTrainConfig:
+    linear_reference: Optional[str] = None
+    input_pattern: Optional[str] = None
+    node: str = "hfetlumi"
+    order: int = 1
+    sbil_min: float = 0.1
+    make_plots: bool = False
+    save_hd5: bool = False
+
+
+@dataclass
+class OnlineRecoveryConfig:
+    method: str = "online"          # "online" or "tables"
+
+    # tables recovery mode
+    afterglow_node: str = "hfafterglowfrac"
+
+    # online recovery mode
+    hfsbr_pattern: str | None = None
+    linear_type1: Optional[List[float]] = field(default_factory=lambda: [0., 0., 0.])
+    quad_type1: Optional[List[float]] = field(default_factory=lambda: [0., 0., 0.])
+    pedestal_node: str = "hfEtPedestal"
+
+
 @dataclass
 class PipelineConfig:
     io: IOConfig
@@ -85,6 +102,7 @@ class PipelineConfig:
     online_recovery: OnlineRecoveryConfig
     afterglow: AfterglowConfig
     type1: Type1Config
+    bunch_train: BunchTrainConfig
     fills: List[int]
 
 
@@ -97,6 +115,7 @@ def load_config(path: str) -> PipelineConfig:
     online_recovery = OnlineRecoveryConfig(**cfg_dict.get("online_recovery", {}))
     afterglow = AfterglowConfig(**cfg_dict.get("afterglow", {}))
     type1 = Type1Config(**cfg_dict.get("type1", {}))
+    bunch_train = BunchTrainConfig(**cfg_dict.get("bunch_train", {}))
     fills = cfg_dict.get("fills", [])
 
     return PipelineConfig(
@@ -105,5 +124,6 @@ def load_config(path: str) -> PipelineConfig:
         online_recovery=online_recovery,
         afterglow=afterglow,
         type1=type1,
+        bunch_train=bunch_train,
         fills=fills,
     )
