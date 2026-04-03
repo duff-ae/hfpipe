@@ -5,8 +5,8 @@ io:
   #input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2024/physics"
   input_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/24_uncorr"
   beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2024/physics"
-  #input_pattern: "{fill}/{fill}_*.hd5"
   input_pattern: "{fill}/{fill}.hd5"
+  #input_pattern: "{fill}/{fill}_*.hd5"
 
   # Output files, to avoid overwriting the old version
   output_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/24"
@@ -23,11 +23,29 @@ io:
   type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/OC/24"
 
 steps:
-  revert_online: false
-  restore_rates: true
-  compute_type1: true
-  apply_type1:   true
-  bunch_train:   true
+  online_recovery: false
+  restore_rates:   true
+  compute_type1:   true
+  apply_type1:     true
+  bunch_train:     true
+
+online_recovery:
+  method: "online" # can be either "tables" or "online"
+
+  # for tables recovery
+  afterglow_node: null
+
+  # for online recovery
+  hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Apr24_24.txt"
+
+  # online type 1
+  # these were in effect from Apr 24, 2024 to Nov 05, 2024
+  linear_type1: [0.00115058, 9.62720752e-05, -2.38976234e-05]
+  quad_type1: [0.00118399, 9.97966854e-05, 7.25134025e-05]
+
+  # online pedestal
+  # set to null if there is no online pedestal
+  pedestal_node: null
 
 afterglow:
 
@@ -78,19 +96,6 @@ bunch_train:
 
   make_plots: True
   save_hd5: False
-
-online:
-  # for restoring rates from online
-  hfsbr: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Apr24_24.txt"
-
-  # online type 1
-  # these were in effect from Apr 24, 2024 to Nov 05, 2024
-  linear_type1: [0.00115058, 9.62720752e-05, -2.38976234e-05]
-  quad_type1: [0.00118399, 9.97966854e-05, 7.25134025e-05]
-
-  # online pedestal
-  # set to null if there is no online pedestal
-  pedestal_table: null
 
 fills:
   - 9639

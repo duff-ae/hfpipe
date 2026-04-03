@@ -6,6 +6,7 @@ from typing import List
 import numpy as np
 import logging
 import h5py
+import re
 import copy
 import math
 import traceback
@@ -19,6 +20,7 @@ from .afterglow_lsq import build_afterglow_solver_from_file
 from .type1_fit import compute_type1_coeffs, save_type1_coeffs, analyze_type1_step
 from .type1_apply import apply_type1_batch
 from .bunch_train import compute_bunch_train_coeffs, save_bunch_train_coeffs, analyze_bunch_train_step, apply_bunch_train_batch
+from .online_recovery import reconstruct_from_tables_batch, reconstruct_from_online_batch
 from .plotter import plot_hist_bx, plot_lumi_comparison, plot_residuals, plot_lasers
 
 from .config import PipelineConfig
@@ -26,34 +28,107 @@ from .config import PipelineConfig
 
 log = logging.getLogger("hfpipe")
 
+def _align_aux_by_keys(
+    main: Dict[str, np.ndarray],
+    aux: Dict[str, np.ndarray],
+    colname: str,
+) -> np.ndarray:
 
-# ---------------------------------------------------------------------------
-# Helpers for Type-1 paths
-# ---------------------------------------------------------------------------
+    keys = ("fillnum", "runnum", "lsnum", "nbnum")
 
-def _get_type1_dir(cfg: PipelineConfig) -> str:
+    T = main[keys[0]].shape[0]
+    main_key = np.stack([main[k].astype(np.int64) for k in keys], axis=1)  # (T, 4)
+
+    aux_T = aux[keys[0]].shape[0]
+    aux_key = np.stack([aux[k].astype(np.int64) for k in keys], axis=1)    # (aux_T, 4)
+
+    index: Dict[tuple, int] = {}
+    for j in range(aux_T):
+        index[tuple(aux_key[j])] = j
+
+    aux_col = aux[colname]
+    tail_shape = aux_col.shape[1:]
+
+    out = np.zeros((T,) + tail_shape, dtype=aux_col.dtype)
+
+    missing = 0
+    for i in range(T):
+        key = tuple(main_key[i])
+        j = index.get(key, None)
+        if j is None:
+            missing += 1
+            continue
+        out[i] = aux_col[j]
+
+    if missing > 0:
+        print(f"[WARN] _align_aux_by_keys: {missing} rows had no match in aux node")
+
+    return out
+
+def _subtract_fixed_pedestal_mod4_inplace(data: dict, ped4) -> None:
     """
-    Return the directory where Type-1 coefficient files are stored.
-
-    Priority:
-      1) cfg.io.type1_dir if set;
-      2) <output_dir>/type1 as a default.
-
-    Ensures that the directory exists.
+    Subtract constant mod4 pedestal from bxraw only:
+      bxraw[:, bx] -= ped4[bx % 4]
     """
-    type1_dir = getattr(cfg.io, "type1_dir", None)
-    if type1_dir is None:
-        type1_dir = os.path.join(cfg.io.output_dir, "type1")
-    os.makedirs(type1_dir, exist_ok=True)
-    return type1_dir
+    if ped4 is None:
+        return
 
+    if "bxraw" not in data:
+        raise KeyError("fixed_pedestal_4 is set but data has no 'bxraw'")
 
-def _get_type1_coeff_path(cfg: PipelineConfig, fill: int) -> str:
+    ped4 = np.asarray(ped4, dtype=np.float32).ravel()
+    if ped4.shape[0] != 4:
+        raise ValueError(f"fixed_pedestal_4 must have length 4, got shape {ped4.shape}")
+
+    bxraw = np.asarray(data["bxraw"])
+    if bxraw.ndim != 2 or bxraw.shape[1] != BX_LEN:
+        raise ValueError(f"bxraw has shape {bxraw.shape}, expected (T, {BX_LEN})")
+
+    ped_vec = ped4[np.arange(BX_LEN) % 4][None, :]  # (1, BX_LEN)
+    data["bxraw"] = (bxraw - ped_vec).astype(bxraw.dtype, copy=False)
+
+    log.info("[fixed_pedestal_4] Subtracted from bxraw (ped4=%s)", ped4.tolist())
+
+def _recompute_derived_from_bxraw_inplace(
+    data: dict,
+    cfg: PipelineConfig,
+    active_mask: np.ndarray,
+) -> None:
     """
-    Return the full path to the Type-1 coefficients file for a given fill.
+    Recompute ONLY derived columns from bxraw:
+      - bx      = bxraw * scale
+      - avgraw  = sum(bxraw over active BX)   (NOT mean)
+      - avg     = avgraw * scale
+
+    This must be the single source of truth for bx/avgraw/avg.
     """
-    type1_dir = _get_type1_dir(cfg)
-    return os.path.join(type1_dir, f"type1_coeffs_fill{fill}.h5")
+    if "bxraw" not in data:
+        raise KeyError("_recompute_derived_from_bxraw_inplace: missing 'bxraw' in data")
+
+    bxraw = np.asarray(data["bxraw"], dtype=np.float32)
+    if bxraw.ndim != 2 or bxraw.shape[1] != BX_LEN:
+        raise ValueError(
+            f"_recompute_derived_from_bxraw_inplace: bxraw has shape {bxraw.shape}, expected (T, {BX_LEN})"
+        )
+
+    mask = np.asarray(active_mask, dtype=np.int32).ravel()
+    if mask.shape[0] != BX_LEN:
+        raise ValueError(
+            f"_recompute_derived_from_bxraw_inplace: active_mask len={mask.shape[0]} != BX_LEN={BX_LEN}"
+        )
+
+    sigvis = getattr(cfg.afterglow, "sigvis", None)
+    scale = 1.0 if not sigvis else 11245.6 / float(sigvis)
+
+    # bx (lumi per BX)
+    data["bx"] = (bxraw * scale).astype(np.float32, copy=False)
+
+    # avgraw = SUM over active BX (mu-space)
+    avgraw = (bxraw * mask[None, :]).sum(axis=1)
+    data["avgraw"] = avgraw.astype(np.float32, copy=False)
+
+    # avg = scaled sum over active BX (lumi-space)
+    data["avg"] = (avgraw * scale).astype(np.float32, copy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -96,101 +171,172 @@ def _inner_merge_one_column(left, right, on, right_col, new_col_name):
 
 
 # ---------------------------------------------------------------------------
-# Step 0: revert the online corrections
+# Helpers for Type-1 paths
 # ---------------------------------------------------------------------------
-def revert_pedestal(mu_batch, pedestal):
-    mu = mu_batch.copy()
-    for i in range(4):
-        mu[:, i::4] += pedestal[:,i][:, None]
-    return mu
 
-def revert_afterglow(mu_batch, HFSBR, linear, quad, active_mask):
-    mu = mu_batch.copy()
-    B, N = mu.shape
-    
-    for ibx in range(N - 1, -1, -1):
-        if not active_mask[ibx]:
-            continue
+def _get_type1_dir(cfg: PipelineConfig) -> str:
+    """
+    Return the directory where Type-1 coefficient files are stored.
 
-        base = mu[:, ibx]
-        base2 = base * base
+    Priority:
+      1) cfg.io.type1_dir if set;
+      2) <output_dir>/type1 as a default.
 
-        type_ = 0
-        for d in range(1, N):
-            idx = (ibx + d) % N
+    Ensures that the directory exists.
+    """
+    type1_dir = getattr(cfg.io, "type1_dir", None)
+    if type1_dir is None:
+        type1_dir = os.path.join(cfg.io.output_dir, "type1")
+    os.makedirs(type1_dir, exist_ok=True)
+    return type1_dir
 
-            if type_ < 3:
-                SBR = base2 * quad[type_] + base * linear[type_] + HFSBR[d]
-            else:
-                SBR = HFSBR[d]
 
-            mu[:, idx] += base * SBR
+def _get_type1_coeff_path(cfg: PipelineConfig, fill: int) -> str:
+    """
+    Return the full path to the Type-1 coefficients file for a given fill.
+    """
+    type1_dir = _get_type1_dir(cfg)
+    return os.path.join(type1_dir, f"type1_coeffs_fill{fill}.h5")
 
-            type_ += 1
+# ---------------------------------------------------------------------------
+# Step 0: recover origin rates
+# ---------------------------------------------------------------------------
+def _load_hfsbr_for_online(cfg: PipelineConfig, fill: int) -> np.ndarray:
+    pattern = cfg.online_recovery.hfsbr_pattern or cfg.afterglow.hfsbr_pattern
+    if not pattern:
+        raise ValueError(
+            "No HFSBR pattern for online recovery "
+            "(both online_recovery.hfsbr_pattern and afterglow.hfsbr_pattern are empty)."
+        )
 
-    return mu
+    path = pattern.format(fill=fill)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"HFSBR file for online recovery not found: {path}")
 
-@log_step("revert_online")
-@timeit("revert_online")
-def revert_online_corrections(data: dict, cfg: PipelineConfig, active_mask: np.ndarray) -> dict:
-    fills = np.unique(data["fillnum"])
-    if fills.size != 1:
-        raise ValueError(f"Expected exactly one fill in file, got {fills}")
-    fill = int(fills[0])
-    
-    # --- load HFSBR matrix ---
-    hfsbr_path = cfg.online.hfsbr.format(fill=fill)
-    if not os.path.exists(hfsbr_path):
-        raise FileNotFoundError(f"HFSBR file not found: {hfsbr_path}")
+    # 1) .npy
+    if path.endswith(".npy"):
+        arr = np.load(path)
+        return np.asarray(arr, dtype=np.float64).ravel()
 
-    HFSBR = np.loadtxt(hfsbr_path, dtype=np.float64, delimiter=",")
-    HFSBR = HFSBR.astype(np.float64, copy=False)
-    N     = HFSBR.shape[0]
+    # 2) .txt / .dat
+    if path.endswith(".txt") or path.endswith(".dat"):
+        with open(path, "r") as f:
+            text = f.read()
 
-    # --- online type1 corrections ---
-    lin_type1 = cfg.online.linear_type1
-    quad_type1 = cfg.online.quad_type1
+        text = text.replace("[", " ").replace("]", " ")
 
-    if N != BX_LEN:
-        raise ValueError(f"HFSBR len={N} does not match BX_LEN={BX_LEN}")
+        tokens = re.split(r"[,\s]+", text)
 
-    active_mask = np.asarray(active_mask, dtype=np.int32)
-    if active_mask.shape[0] != N:
-        raise ValueError("active_mask must match HFSBR length")
-    
-    bxraw_obs = data["bxraw"]
-    assert bxraw_obs.shape[1] == BX_LEN
+        values = []
+        for tok in tokens:
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                values.append(float(tok))
+            except ValueError:
+                continue
 
-    # first revert pedestal
-    if "pedestal" in data.keys():
-        bxraw_obs = revert_pedestal(bxraw_obs, data["pedestal"])
+        if not values:
+            raise RuntimeError(f"HFSBR .txt file {path} did not contain any numeric tokens")
 
-    # Split T into batches
-    n_jobs = cfg.afterglow.n_jobs
-    T = bxraw_obs.shape[0]
-    batch_size = min(T, max(10, math.ceil(T / (4 * n_jobs))))
-    batches = [bxraw_obs[i : i + batch_size] for i in range(0, bxraw_obs.shape[0], batch_size)]
+        arr = np.asarray(values, dtype=np.float64).ravel()
 
-    # Parallel processing
-    results = Parallel(n_jobs=n_jobs, prefer="processes")(
-        delayed(revert_afterglow)(batch, HFSBR, lin_type1, quad_type1, active_mask)
-        for batch in tqdm(batches, desc="Reverting Online Afterglow", unit="batch")
+        if arr.shape[0] < BX_LEN:
+            raise RuntimeError(
+                f"HFSBR from {path} has length {arr.shape[0]} < BX_LEN={BX_LEN}"
+            )
+
+        return arr
+
+    # 3) .h5 / .hd5
+    if path.endswith(".h5") or path.endswith(".hd5"):
+        with h5py.File(path, "r") as h5:
+            if "hfsbr" in h5:
+                return np.asarray(h5["hfsbr"][:], dtype=np.float64).ravel()
+            for name, obj in h5.items():
+                if hasattr(obj, "shape"):
+                    return np.asarray(obj[...], dtype=np.float64).ravel()
+        raise RuntimeError(f"Could not find HFSBR dataset in {path}")
+
+    raise RuntimeError(
+        f"Unknown HFSBR file format for path {path}. "
+        f"Please adapt _load_hfsbr_for_online."
     )
 
-    # Stack results back
-    data["bxraw"] = np.vstack(results)
+@log_step("online_recovery")
+@timeit("online_recovery")
+def recover_bxraw_step(
+    data: dict,
+    cfg: PipelineConfig,
+    active_mask: np.ndarray,
+    fill: int,
+    input_pattern: str,
+) -> dict:
+    bxraw_final = np.asarray(data["bxraw"], dtype=np.float32)
+    rec_cfg = cfg.online_recovery
 
-    # ------------------------------------------------------------------
-    # Recompute bx and avg
-    # ------------------------------------------------------------------
-    sigvis = cfg.afterglow.sigvis
-    scale = 1.0 if not sigvis else 11245.6 / float(sigvis)
+    use_tables = (rec_cfg.method == "tables")
+    use_online = (rec_cfg.method == "online")
 
-    bx_lumi = (data["bxraw"] * scale).astype(np.float32, copy=False)
-    data["bx"] = bx_lumi
-    data["avg"] = bx_lumi.mean(axis=1).astype(np.float32)
+        
+    if use_online:
+        hfsbr = _load_hfsbr_for_online(cfg, fill)
+        linear = np.array(rec_cfg.linear_type1)
+        quad = np.array(rec_cfg.quad_type1)
+
+        states_online = reconstruct_from_online_batch(
+            bxraw_final=bxraw_final,
+            hfsbr=hfsbr,
+            linear=linear,
+            quad=quad,
+            pedestal=(data["pedestal"] if cfg.online_recovery.pedestal_node is not None else None),
+            active_mask=active_mask,
+            zero_bx=(3553, 3554, 3555, 3556, 3557),
+            show_progress=True,
+        )
+
+        data["bxraw"] = states_online
+    elif use_tables:
+        ped_node = rec_cfg.pedestal_node
+        aft_node = rec_cfg.afterglow_node
+
+        ped_data = load_hd5_to_arrays(
+            cfg.io.input_dir,
+            input_pattern,
+            node=ped_node,
+        )
+        aft_data = load_hd5_to_arrays(
+            cfg.io.input_dir,
+            input_pattern,
+            node=aft_node,
+        )
+
+        ped_4 = _align_aux_by_keys(
+            main=data,
+            aux=ped_data,
+            colname="bxraw",
+        ).astype(np.float32)
+
+        aft_frac = _align_aux_by_keys(
+            main=data,
+            aux=aft_data,
+            colname="bxraw",
+        ).astype(np.float32)
+
+
+        states_tables = reconstruct_from_tables_batch(
+            bxraw_final=bxraw_final,
+            pedestal_4=ped_4,
+            afterglow_frac=aft_frac,
+        )
+
+        data["bxraw"] = states_tables
+    else:
+        raise RuntimeError("online_recovery: states_online is None, check config")
 
     return data
+
 
 # ---------------------------------------------------------------------------
 # Step 1: afterglow / recovery of mu_true
@@ -207,6 +353,7 @@ def calculate_dynamic_pedestal(mu_hist: np.ndarray) -> np.ndarray:
     n_sample = 13
     pedestal = np.zeros(4, dtype=np.float32)
 
+    
     # last 52 BX (3500..3551)
     base = 3500
     for ibx in range(4):
@@ -214,6 +361,7 @@ def calculate_dynamic_pedestal(mu_hist: np.ndarray) -> np.ndarray:
         for j in range(ibx, 4 * n_sample, 4):
             s += mu_hist[base + j]
         pedestal[ibx] = s / n_sample
+    
     return pedestal
 
 
@@ -283,12 +431,7 @@ def restore_rates_step(data: dict, cfg: PipelineConfig, active_mask: np.ndarray)
     # ------------------------------------------------------------------
     # Recompute bx and avg (these should be AFTER pedestal subtraction)
     # ------------------------------------------------------------------
-    sigvis = cfg.afterglow.sigvis
-    scale = 1.0 if not sigvis else 11245.6 / float(sigvis)
-
-    bx_lumi = (mu_corr * scale).astype(np.float32, copy=False)
-    data["bx"] = bx_lumi
-    data["avg"] = bx_lumi.mean(axis=1).astype(np.float32)
+    _recompute_derived_from_bxraw_inplace(data, cfg, active_mask)
 
     return data
 
@@ -442,14 +585,6 @@ def apply_type1_step(data, cfg, active_mask: np.ndarray, fill: int):
 
     data["bxraw"] = corrected_mu
 
-    # --- recompute bx and avg AFTER Type-1 subtraction ---
-    sigvis = getattr(cfg.afterglow, "sigvis", None)
-    scale = 1.0 if not sigvis else 11245.6 / float(sigvis)
-
-    bx_lumi = (corrected_mu * scale).astype(np.float32, copy=False)
-    data["bx"] = bx_lumi
-    data["avg"] = bx_lumi.mean(axis=1).astype(np.float32)
-
     # --- optional "after Type-1" diagnostics ---
     if getattr(cfg.type1, "debug_after_apply", False):
         analyze_type1_step(
@@ -459,6 +594,8 @@ def apply_type1_step(data, cfg, active_mask: np.ndarray, fill: int):
             fill=fill,
             tag="after"
         )
+
+    _recompute_derived_from_bxraw_inplace(data, cfg, active_mask)
 
     return data
 
@@ -632,8 +769,8 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
     merge_cols = ['fillnum', 'runnum', 'lsnum', 'nbnum']
 
     # add the pedestal data (if needed)
-    if cfg.online.pedestal_table is not None and cfg.steps.revert_online:
-        ped = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.online.pedestal_table)
+    if cfg.online_recovery.pedestal_node is not None and cfg.steps.revert_online:
+        ped = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.online_recovery.pedestal_node)
 
         if data["timestampsec"].size != ped["timestampsec"].size:
             log.warning(
@@ -718,12 +855,17 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
         np.nan_to_num(data['bxraw'], copy=False, posinf=0.0, neginf=0.0)
 
 
-
-    # before doing any processing, revert the online corrections
-    if cfg.steps.revert_online:
+    # --- 2) pipeline steps ---
+    if cfg.steps.online_recovery:
         if cfg.type1.make_plots:
             plot_hist_bx(data, cfg, fill, 'Online Luminosity')
-        data = revert_online_corrections(data, cfg, active_mask)
+        data = recover_bxraw_step(
+            data=data,
+            cfg=cfg,
+            active_mask=active_mask,
+            fill=fill,
+            input_pattern=input_name,
+        )
 
     # plot the uncorrected rates
     # TODO also need to tell the plot which year this is
@@ -733,9 +875,13 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
         # save the uncorrected rates for later comparison
         data_origin = copy.deepcopy(data)
 
-    # --- 2) pipeline steps ---
-
+    # --- 2b) subtract fixed mod4 pedestal BEFORE any corrections/plots/fits ---
     if cfg.steps.restore_rates:
+
+        ped4 = getattr(cfg.afterglow, "fixed_pedestal_4", None)
+        if ped4 is not None:
+            _subtract_fixed_pedestal_mod4_inplace(data, ped4)
+
         data = restore_rates_step(data, cfg, active_mask)
 
         # plot after t2 but before t1
@@ -759,6 +905,12 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
         data = compute_bunch_train_step(data, cfg, active_mask, fill)
         data = apply_bunch_train_step(data, cfg, active_mask, fill)
 
+    # recompute derived quantities (lumi, avg_raw, etc.) for safety
+    _recompute_derived_from_bxraw_inplace(data, cfg, active_mask)
+
+    # plot the corrected rates
+    # TODO likely will want to use a different flag
+    # TODO also need to tell the plot which year this is
     if cfg.type1.make_plots:
         plot_hist_bx(data, cfg, fill, 'Full Corr. Luminosity')
         plot_residuals(data, cfg, active_mask, fill, 'full_corr')

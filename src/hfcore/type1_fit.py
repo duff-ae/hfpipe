@@ -45,9 +45,9 @@ def _collect_type1_points(
         and active_mask[bx + dt] == 0 for all dt = 1..offset
         (following 'offset' BX are non-colliding).
     """
-    active_mask = np.asarray(active_mask, dtype=np.int32)
-    bxraw = np.asarray(bxraw, dtype=np.float64)
-    avg = np.asarray(avg, dtype=np.float64)
+    #active_mask = np.asarray(active_mask, dtype=np.int32)
+    #bxraw = np.asarray(bxraw, dtype=np.float64)
+    #avg = np.asarray(avg, dtype=np.float64)
 
     assert bxraw.shape[1] == BX_LEN, "bxraw must be (T, BX_LEN)"
 
@@ -87,12 +87,11 @@ def _collect_type1_points(
         y_after = hist[afterglow_indices] # mu_afterglow
 
         # avoid division by zero
-        mask_nonzero = y > 0.0
-        if not np.any(mask_nonzero):
-            continue
+        mask_valid = y > sbil_min
 
-        y = y[mask_nonzero]
-        y_after = y_after[mask_nonzero]
+        y = y[mask_valid]
+        y_after = y_after[mask_valid]
+
         frac = y_after / y
 
         y_vals.append(y)
@@ -167,8 +166,8 @@ def compute_type1_coeffs(
       index t corresponds to BX + t, i.e. t=1 -> BX+1, etc.
       t=0 is kept zero (no subtraction for the colliding BX itself).
     """
-    bxraw = np.array(bxraw, dtype=np.float64)
-    avg = np.asarray(avg, dtype=np.float64)
+    bxraw = np.array(bxraw[::5,:], dtype=np.float64)
+    avg = np.asarray(avg[::5], dtype=np.float64)
     active_mask = np.asarray(active_mask, dtype=np.int32)
 
     assert bxraw.ndim == 2 and bxraw.shape[1] == BX_LEN, "bxraw must be (T, BX_LEN)"
@@ -463,7 +462,7 @@ def analyze_type1_step(data, cfg, active_mask, fill: int, tag: str = "before"):
         aft = hists[:, afterglow_idx]       # (T_sel, Npairs)
 
         # protect against division by zero
-        valid = coll > 0.0
+        valid = np.isfinite(coll) & np.isfinite(aft) & (coll > sbil_min)
         coll = coll[valid]
         aft = aft[valid]
 

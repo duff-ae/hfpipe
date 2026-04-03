@@ -9,8 +9,8 @@ import yaml
 
 @dataclass
 class StepsConfig:
-    # 0) revert online Type2 correctios
-    revert_online: bool = False
+    # 0) revert online corrections
+    online_recovery: bool = False
 
     # 1) восстановление истинных bxraw (afterglow LSQ)
     restore_rates: bool = False
@@ -47,6 +47,8 @@ class AfterglowConfig:
     hfsbr_pattern: Optional[str] = None
     n_jobs: int = -1
     sigvis: Optional[float] = None
+    fixed_pedestal_4: Optional[List[float]] = None
+
 
 @dataclass
 class Type1Config:
@@ -67,6 +69,7 @@ class Type1Config:
     debug_after_apply: bool = False
     save_hd5: bool = False
 
+
 @dataclass
 class BunchTrainConfig:
     linear_reference: Optional[str] = None
@@ -77,22 +80,29 @@ class BunchTrainConfig:
     make_plots: bool = False
     save_hd5: bool = False
 
+
 @dataclass
-class OnlineConfig:
-    hfsbr: Optional[str] = None
+class OnlineRecoveryConfig:
+    method: str = "online"          # "online" or "tables"
+
+    # tables recovery mode
+    afterglow_node: str = "hfafterglowfrac"
+
+    # online recovery mode
+    hfsbr_pattern: str | None = None
     linear_type1: Optional[List[float]] = field(default_factory=lambda: [0., 0., 0.])
     quad_type1: Optional[List[float]] = field(default_factory=lambda: [0., 0., 0.])
-    pedestal_table: Optional[str] = None
+    pedestal_node: str = "hfEtPedestal"
 
 
 @dataclass
 class PipelineConfig:
     io: IOConfig
     steps: StepsConfig
+    online_recovery: OnlineRecoveryConfig
     afterglow: AfterglowConfig
     type1: Type1Config
     bunch_train: BunchTrainConfig
-    online: OnlineConfig
     fills: List[int]
 
 
@@ -102,18 +112,18 @@ def load_config(path: str) -> PipelineConfig:
 
     io = IOConfig(**cfg_dict["io"])
     steps = StepsConfig(**cfg_dict.get("steps", {}))
+    online_recovery = OnlineRecoveryConfig(**cfg_dict.get("online_recovery", {}))
     afterglow = AfterglowConfig(**cfg_dict.get("afterglow", {}))
     type1 = Type1Config(**cfg_dict.get("type1", {}))
     bunch_train = BunchTrainConfig(**cfg_dict.get("bunch_train", {}))
-    online = OnlineConfig(**cfg_dict.get("online", {}))
     fills = cfg_dict.get("fills", [])
 
     return PipelineConfig(
         io=io,
         steps=steps,
+        online_recovery=online_recovery,
         afterglow=afterglow,
         type1=type1,
         bunch_train=bunch_train,
-        online=online,
         fills=fills,
     )
