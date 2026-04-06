@@ -335,7 +335,7 @@ class AfterglowSolver:
         Replace only bx_to_clean inside the wrap region with the extrapolated tail.
         Returns patched signal, replaced indices, and saved original buffer.
         """
-        y = np.asarray(mu_obs, dtype=np.float64).copy()
+        y = np.asarray(mu_obs, dtype=np.float64)#.copy()
 
         replace_idx = np.asarray(patch["replace_idx"], dtype=np.int64)
         replace_pred = np.asarray(patch["replace_pred"], dtype=np.float64)

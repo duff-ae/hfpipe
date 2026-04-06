@@ -105,7 +105,7 @@ def _recompute_derived_from_bxraw_inplace(
     if "bxraw" not in data:
         raise KeyError("_recompute_derived_from_bxraw_inplace: missing 'bxraw' in data")
 
-    bxraw = np.asarray(data["bxraw"], dtype=np.float32)
+    bxraw = np.asarray(data["bxraw"], dtype=np.float64)
     if bxraw.ndim != 2 or bxraw.shape[1] != BX_LEN:
         raise ValueError(
             f"_recompute_derived_from_bxraw_inplace: bxraw has shape {bxraw.shape}, expected (T, {BX_LEN})"
@@ -121,14 +121,14 @@ def _recompute_derived_from_bxraw_inplace(
     scale = 1.0 if not sigvis else 11245.6 / float(sigvis)
 
     # bx (lumi per BX)
-    data["bx"] = (bxraw * scale).astype(np.float32, copy=False)
+    data["bx"] = (bxraw * scale).astype(np.float64, copy=False)
 
     # avgraw = SUM over active BX (mu-space)
     avgraw = (bxraw * mask[None, :]).sum(axis=1)
-    data["avgraw"] = avgraw.astype(np.float32, copy=False)
+    data["avgraw"] = avgraw.astype(np.float64, copy=False)
 
     # avg = scaled sum over active BX (lumi-space)
-    data["avg"] = (avgraw * scale).astype(np.float32, copy=False)
+    data["avg"] = (avgraw * scale).astype(np.float64, copy=False)
 
 
 # ---------------------------------------------------------------------------

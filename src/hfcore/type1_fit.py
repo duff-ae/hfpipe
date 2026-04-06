@@ -166,8 +166,8 @@ def compute_type1_coeffs(
       index t corresponds to BX + t, i.e. t=1 -> BX+1, etc.
       t=0 is kept zero (no subtraction for the colliding BX itself).
     """
-    bxraw = np.array(bxraw[::5,:], dtype=np.float64)
-    avg = np.asarray(avg[::5], dtype=np.float64)
+    bxraw = np.array(bxraw, dtype=np.float64)
+    avg = np.asarray(avg, dtype=np.float64)
     active_mask = np.asarray(active_mask, dtype=np.int32)
 
     assert bxraw.ndim == 2 and bxraw.shape[1] == BX_LEN, "bxraw must be (T, BX_LEN)"
@@ -206,7 +206,7 @@ def compute_type1_coeffs(
         orders[off] = order
 
         # TODO apply corrections in reverse?
-        for ibx in range(0, BX_LEN - off):
+        for ibx in reversed(range(0, BX_LEN - off)):
             if active_mask[ibx] != 1:
                 continue
             y = bxraw[:, ibx]
@@ -423,6 +423,10 @@ def analyze_type1_step(data, cfg, active_mask, fill: int, tag: str = "before"):
     make_plots: bool = bool(getattr(cfg.type1, "make_plots", False))
     save_hd5: bool = bool(getattr(cfg.type1, "save_hd5", False))
 
+    # save memory
+    bxraw = _downsample(bxraw)
+    avg   = _downsample(avg)
+
     # base directory for Type-1 debug output
     type1_dir = getattr(cfg.io, "type1_dir", None)
     if type1_dir is None:
@@ -557,8 +561,8 @@ def analyze_type1_step(data, cfg, active_mask, fill: int, tag: str = "before"):
             fig = plt.figure(figsize=(7, 5))
             # scatter
             plt.plot(
-                _downsample(bx_value),
-                _downsample(bx_type1),
+                bx_value,
+                bx_type1,
                 ".",
                 alpha=0.2,
                 label=f"Type-1 fraction for BX[i+{offset}]",
