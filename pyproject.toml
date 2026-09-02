@@ -2,5 +2,18 @@
 name = "hfpipe"
 version = "0.1.0"
 
+dependencies = [
+    "numpy",
+    "tables",
+    "pyyaml",
+    "tqdm",
+    "h5py",
+    "matplotlib",
+    "mplhep",
+    "joblib",
+    "scipy",
+    "cffi",
+]
+
 [project.scripts]
 hfpipe-run = "hfcli.run_pipeline:main"

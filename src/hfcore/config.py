@@ -39,12 +39,11 @@ class StepsConfig:
 @dataclass
 class IOConfig:
     input_dir: str
-    beam_dir: str
     input_pattern: str
     output_dir: str
     output_pattern: str
     node: str = "hfetlumi"
-    active_mask_pattern: str = ""  # "/path/to/activeBXMask_fill{fill}.npy"
+    active_mask_pattern: str = ""  # "/eos/cms/store/group/dpg_bril/comm_bril/2024/online/per-bcid/{fill}/{fill}_colliding_bunch_mask.json"
     type1_dir: Optional[str] = None
 
 
