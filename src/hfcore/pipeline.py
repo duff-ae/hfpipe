@@ -27,7 +27,7 @@ from .type1_fit import (
     analyze_type1_fill_chunked,
 )
 from .type1_apply import apply_type1_batch
-#from .online_recovery import reconstruct_from_tables_batch, reconstruct_from_online_batch
+from .online_recovery import reconstruct_from_tables_batch, OnlineRecoverySolver
 from .plotter import (
     BxProfileAccumulator,
     plot_hist_bx_from_profile,
@@ -227,53 +227,60 @@ def _load_hfsbr_for_online(cfg: PipelineConfig, fill: int) -> np.ndarray:
     )
 
 
-def recover_bxraw_step(
-    data: dict,
-    cfg: PipelineConfig,
-    active_mask: np.ndarray,
-    fill: int,
-    input_pattern: str,
+def _recover_online_chunk(
+    chunk: dict,
+    method: str,
+    *,
+    pedestal_data: dict | None = None,
+    afterglow_data: dict | None = None,
+    online_solver: OnlineRecoverySolver | None = None,
 ) -> dict:
-    bxraw_final = np.asarray(data["bxraw"], dtype=np.float32)
-    rec_cfg = cfg.online_recovery
+    """
+    Undo the corrections already applied by the online HF processing.
 
-    use_tables = (rec_cfg.method == "tables")
-    use_online = (rec_cfg.method == "online")
+    Both supported methods return the same quantity in ``bxraw``:
+    the histogram before the online pedestal/afterglow corrections.
 
-    states_tables = None
-    states_online = None
+    Auxiliary table alignment deliberately uses the original
+    ``_align_aux_by_keys`` helper; no assumptions are made about row/chunk
+    ordering between HDF5 nodes.
+    """
+    bxraw_final = np.asarray(chunk["bxraw"], dtype=np.float32)
 
-    '''
-    if use_tables:
-        ped_node = rec_cfg.pedestal_node
-        aft_node = rec_cfg.afterglow_node
+    if method == "tables":
+        if pedestal_data is None or afterglow_data is None:
+            raise RuntimeError(
+                "online_recovery method='tables' requires pedestal and afterglow tables"
+            )
 
-        ped_data = load_hd5_to_arrays(cfg.io.input_dir, input_pattern, node=ped_node)
-        aft_data = load_hd5_to_arrays(cfg.io.input_dir, input_pattern, node=aft_node)
+        pedestal_4 = _align_aux_by_keys(
+            main=chunk, aux=pedestal_data, colname="bxraw"
+        ).astype(np.float32)
+        afterglow_frac = _align_aux_by_keys(
+            main=chunk, aux=afterglow_data, colname="bxraw"
+        ).astype(np.float32)
 
-        ped_4 = _align_aux_by_keys(main=data, aux=ped_data, colname="bxraw").astype(np.float32)
-        aft_frac = _align_aux_by_keys(main=data, aux=aft_data, colname="bxraw").astype(np.float32)
-
-        states_tables = reconstruct_from_tables_batch(
-            bxraw_final=bxraw_final, pedestal_4=ped_4, afterglow_frac=aft_frac,
+        result = reconstruct_from_tables_batch(
+            bxraw_final=bxraw_final,
+            pedestal_4=pedestal_4,
+            afterglow_frac=afterglow_frac,
         )
 
-    
-    if use_online:
-        hfsbr = _load_hfsbr_for_online(cfg, fill)
-        states_online = reconstruct_from_online_batch(
-            bxraw_final=bxraw_final, hfsbr=hfsbr, active_mask=active_mask,
-            zero_bx=(3553, 3554, 3555, 3556, 3557), show_progress=True,
-        )
-    '''
-    if use_tables:
-        data["bxraw"] = states_tables.mu_before
+    elif method == "online":
+        if online_solver is None:
+            raise RuntimeError(
+                "online_recovery method='online' requires OnlineRecoverySolver"
+            )
+        result = online_solver.recover_batch(bxraw_final)
+
     else:
-        if states_online is None:
-            raise RuntimeError("online_recovery: states_online is None, check config")
-        data["bxraw"] = states_online.mu_before
+        raise ValueError(
+            f"Unknown online_recovery.method={method!r}; expected 'tables' or 'online'"
+        )
 
-    return data
+    out = dict(chunk)
+    out["bxraw"] = result.recovered_raw
+    return out
 
 
 def calculate_dynamic_pedestal(mu_hist: np.ndarray) -> np.ndarray:
@@ -431,6 +438,46 @@ def _pass0_prepare(
     ped4 = None
     warm_state: dict = {}
 
+    # Online-recovery objects/tables are prepared once per fill.
+    online_method: Optional[str] = None
+    online_solver: Optional[OnlineRecoverySolver] = None
+    online_ped_data = None
+    online_aft_data = None
+
+    if cfg.steps.online_recovery:
+        online_method = str(cfg.online_recovery.method).lower()
+
+        if online_method == "tables":
+            online_ped_data = load_hd5_to_arrays(
+                cfg.io.input_dir,
+                input_name,
+                node=cfg.online_recovery.pedestal_node,
+            )
+            online_aft_data = load_hd5_to_arrays(
+                cfg.io.input_dir,
+                input_name,
+                node=cfg.online_recovery.afterglow_node,
+            )
+
+        elif online_method == "online":
+            hfsbr_online = _load_hfsbr_for_online(cfg, fill)
+            online_solver = OnlineRecoverySolver(
+                hfsbr=hfsbr_online,
+                active_mask=active_mask,
+            )
+
+        else:
+            raise ValueError(
+                f"Unknown online_recovery.method={cfg.online_recovery.method!r}; "
+                "expected 'tables' or 'online'"
+            )
+
+        log.info(
+            "[online_recovery] fill %d: method=%s",
+            fill,
+            online_method,
+        )
+
     if cfg.steps.restore_rates:
         hfsbr_path = cfg.afterglow.hfsbr_pattern.format(fill=fill)
         if not os.path.exists(hfsbr_path):
@@ -463,6 +510,15 @@ def _pass0_prepare(
                 laser_vals = compute_laser_columns_chunk(raw_bxraw, scale)
                 for bcid, vals in laser_vals.items():
                     raw_laser_accs[bcid].add(vals)
+
+            if cfg.steps.online_recovery:
+                chunk = _recover_online_chunk(
+                    chunk,
+                    online_method,
+                    pedestal_data=online_ped_data,
+                    afterglow_data=online_aft_data,
+                    online_solver=online_solver,
+                )
 
             if cfg.steps.restore_rates:
                 if ped4 is not None:
