@@ -22,7 +22,7 @@ io:
   type1_dir: "/eos/home-a/alshevel/hfpipe/plots/25_test"
 
 steps:
-  online_recovery: false
+  online_recovery: true
   restore_rates: true
   compute_type1: true
   apply_type1: false

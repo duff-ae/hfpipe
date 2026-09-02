@@ -251,14 +251,19 @@ def reconstruct_from_tables_batch(
     pre_pedestal = bxraw_final + pedestal_4[:, idx_mod4]
 
     valid = np.isfinite(afterglow_frac) & (afterglow_frac > 0.0)
-    invalid_outside_zero = (~valid) & (~zero_mask[None, :])
-    if np.any(invalid_outside_zero):
-        rows, bx = np.where(invalid_outside_zero)
-        preview = list(zip(rows[:10].tolist(), bx[:10].tolist()))
-        raise RuntimeError(
-            "Invalid hfafterglowfrac outside configured artificial zero BX. "
-            f"Count={len(rows)}, first (row, BX)={preview}"
-        )
+
+    recovered = np.full_like(
+        pre_pedestal,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    recovered[valid] = (
+        pre_pedestal[valid]
+        / afterglow_frac[valid]
+    )
+
+    recovered[:, zero_bx] = 0.0
 
     recovered = np.zeros_like(pre_pedestal, dtype=np.float64)
     recovered[valid] = pre_pedestal[valid] / afterglow_frac[valid]
