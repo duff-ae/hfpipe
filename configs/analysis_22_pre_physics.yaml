@@ -1,13 +1,15 @@
 io:
   # Input HFET hd5 files, one file per fill
   # Expected path: /cephfs/brilshare/alshevel/hf_origin/hfet/25/<fill>/<fill>_*.hd5
-  input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2022/physics"
-  beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2022/physics"
+  #input_dir: "/cephfs/brilshare/alshevel/hf_origin/hfet/24"
+  input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2022/online/per-bcid/"
   input_pattern: "{fill}/{fill}_*.hd5"
 
   # Output files, to avoid overwriting the old version
   # Resulting path: /cephfs/brilshare/alshevel/hf_reprocessed/hfet/25_test/<fill>/<fill>.hd5
-  output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/22"
+  #output_dir: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/24"
+  output_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2022/reprocessed/hfet/"
+  #output_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2022/raw/hfet/"
   output_pattern: "{fill}/{fill}.hd5"
 
   # HDF5 node / key with the HFET table
@@ -15,16 +17,16 @@ io:
 
   # Precomputed active BX mask (shape=(3564,), dtype=int)
   # Can be produced once from the beam hd5
-  active_mask_pattern: "/cephfs/brilshare/alshevel/hf_masks/activeBXMask_fill{fill}.npy"
+  active_mask_pattern: "/eos/cms/store/group/dpg_bril/comm_bril/2022/online/per-bcid/{fill}/{fill}_colliding_bunch_mask.json"
 
   # Directory where Type-1 diagnostic plots (etc.) are stored
-  type1_dir: "/eos/home-a/alshevel/hf_plots_2022"
+  type1_dir: "/eos/home-a/alshevel/hfpipe/plots/22_pre"
 
 steps:
-  online_recovery: true 
+  online_recovery: true
   restore_rates: true
   compute_type1: true
-  apply_type1: true
+  apply_type1: false
 
 online_recovery:
   method: "online"       # "online" or "tables"
@@ -39,11 +41,11 @@ afterglow:
   # BX indices to hard-clean (mu_true = 0) – analogue of BX_TO_CLEAN
   bx_to_clean: [3488, 3489, 3490, 3491, 3492, 3493, 3553, 3554, 3555, 3556, 3557]
   
-  hfsbr_pattern: "/eos/home-a/alshevel/hfpipe/input/afterglow/hfet_lsq_22.txt"
+  hfsbr_pattern: "/eos/home-a/alshevel/hfpipe/input/afterglow/hfet_lsq_test.txt"
   # Regularization strengths for the LSQ inversion
   lambda_reg: 0.01
   lambda_nonactive: 0.05
-  n_jobs: 16
+  n_jobs: 1
   # From your note: sigvis = 3113
   # Conversion example: bx = bxraw * 11245.6 / sigvis
   sigvis: 3352
@@ -68,4 +70,4 @@ type1:
 
 fills:
   # For testing: run over a single fill. Later this can be replaced by a list of stable fills.
-  - 8113 # 8098
+  - 10084
