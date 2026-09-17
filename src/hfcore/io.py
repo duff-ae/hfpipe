@@ -49,6 +49,7 @@ def save_to_hd5(
     """
     # Full file path
     full_path = os.path.join(path, name)
+    #full_path = os.path.join(path, name.split('/')[0] + '/' + globals()['remove_me'])
 
     # Ensure the parent directory exists
     parent_dir = os.path.dirname(full_path)
@@ -121,8 +122,12 @@ def load_hd5_to_arrays(directory: str, pattern: str, node: str = "hfetlumi") -> 
         If a file does not contain the requested node, or if column shapes
         are inconsistent across files.
     """
+    #global remove_me
     full_pattern = os.path.join(directory, pattern)
     paths = sorted(glob.glob(full_pattern))
+    #if len(paths) > 1:
+    #    paths = [paths[18]]
+    #    remove_me = paths[0].split('/')[-1]
 
     if not paths:
         raise FileNotFoundError(f"No files matching pattern '{full_pattern}'")

@@ -73,7 +73,7 @@ def _collect_bunch_train_points(
         head = _find_head(heads, tails)
 
         # avoid division by zero
-        mask_nonzero = hist[head] > 0.0
+        mask_nonzero = hist[head] > sbil_min
         if not np.any(mask_nonzero):
             continue
 
@@ -228,7 +228,7 @@ def analyze_bunch_train_step(data, cfg, active_mask, fill: int, tag: str = "befo
             tail_ref = hists_ref[:, tail_idx]       # (T_sel, Npairs)
 
             # protect against division by zero
-            valid = head > 0.0
+            valid = head > sbil_min #0.0
             head     = head[valid]
             tail     = tail[valid]
             head_ref = head_ref[valid]

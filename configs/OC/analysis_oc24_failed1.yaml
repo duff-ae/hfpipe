@@ -1,13 +1,15 @@
+# online configuration valid between the dates of Aug 11, 2022 and Apr 24, 2024
+
 io:
   # Input HFET hd5 files, one file per fill
-  input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2022/physics"
-  #input_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/22_uncorr"
-  beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2022/physics"
-  input_pattern: "{fill}/{fill}_*.hd5"
-  #input_pattern: "{fill}/{fill}.hd5"
+  #input_dir: "/eos/cms/store/group/dpg_bril/comm_bril/2024/physics"
+  input_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/24_uncorr"
+  beam_dir:  "/eos/cms/store/group/dpg_bril/comm_bril/2024/physics"
+  #input_pattern: "{fill}/{fill}_*.hd5"
+  input_pattern: "{fill}/{fill}.hd5"
 
   # Output files, to avoid overwriting the old version
-  output_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/22"
+  output_dir: "/cephfs/brilshare/leeja/hf_reprocessed/hfoc/24"
   output_pattern: "{fill}/{fill}.hd5"
 
   # HDF5 node / key with the HF table
@@ -18,7 +20,7 @@ io:
   active_mask_pattern: "/cephfs/brilshare/alshevel/hf_masks/activeBXMask_fill{fill}.npy"
 
   # Directory where Type-1 diagnostic plots (etc.) are stored
-  type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/OC/22"
+  type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/OC/24"
 
 steps:
   online_recovery: false
@@ -65,7 +67,7 @@ type1:
   offsets: [1, 2, 3, 4]
 
   # Minimum SBIL for including a point in the Type-1 fit
-  sbil_min: 0.002
+  sbil_min: 0.1
 
   # Whether to produce Type-1 summary plots
   make_plots: true
@@ -78,21 +80,18 @@ type1:
 
 bunch_train:
   # location of data to use as a linear reference for the bunch train effect
-  linear_reference: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/22"
-  input_pattern: "{fill}/{fill}.hd5"
+  linear_reference: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/24_final/"
+  input_pattern: "{fill}/{fill}_*.hd5"
   node: "hfetlumi"
-  #linear_reference: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
-  #input_pattern: "{fill}/{fill}_*.hd5"
-  #node: "bcm1futcalumi"
 
   # order of the poly fit to apply
   order: 3
   
   # Minimum SBIL for including a point in the fit
-  sbil_min: 0.002
+  sbil_min: 0.1
 
   make_plots: True
   save_hd5: False
 
 fills:
- - 8381
+ - 9514

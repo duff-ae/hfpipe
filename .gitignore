@@ -2,6 +2,7 @@
 data/**
 *.hd5
 out/**
+*.out
 *.png
 
 # test scripts
@@ -12,4 +13,5 @@ replace_afterglow.sh
 .venv*/
 __pycache__/
 *.pyc
+src/hfpipe.egg-info/
 

@@ -115,7 +115,7 @@ def apply_type1_batch(
 
         # Loop over all offsets t = 0..type_len
         # TODO apply in reverse?
-        for t in reversed(range(type_len + 1)):
+        for t in range(type_len + 1):
             j = ibx + t
             # poly(y) = p0[t] + p1[t] * y + p2[t] * y^2
             poly = p0[t] + p1[t] * y + p2[t] * y2

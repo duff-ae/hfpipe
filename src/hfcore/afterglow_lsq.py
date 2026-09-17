@@ -376,7 +376,7 @@ class AfterglowSolver:
         Y = np.fft.fft(y)
         denom = np.abs(self.FH) ** 2 + self.deconv_eps
         X = self.FH_conj * Y / denom
-        x = np.fft.ifft(X).real
+        x = np.fft.ifft(X).real #TODO ??? is this right
         return x
 
     def _postprocess_mu(self, mu_true: np.ndarray) -> np.ndarray:

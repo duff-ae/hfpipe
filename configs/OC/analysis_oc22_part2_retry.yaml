@@ -21,7 +21,7 @@ io:
   type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/OC/22"
 
 steps:
-  online_recovery: false
+  online_recovery: true
   restore_rates:   true
   compute_type1:   true
   apply_type1:     true
@@ -37,6 +37,7 @@ online_recovery:
   hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Aug10_22.txt"
 
   # online type 1
+  # these were in effect from Apr 24, 2024 to Nov 05, 2024
   linear_type1: [0., 0., 0.]
   quad_type1: [0., 0., 0.]
 
@@ -65,7 +66,7 @@ type1:
   offsets: [1, 2, 3, 4]
 
   # Minimum SBIL for including a point in the Type-1 fit
-  sbil_min: 0.002
+  sbil_min: 0.1
 
   # Whether to produce Type-1 summary plots
   make_plots: true
@@ -78,21 +79,19 @@ type1:
 
 bunch_train:
   # location of data to use as a linear reference for the bunch train effect
-  linear_reference: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/22"
+  linear_reference: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/22/"
   input_pattern: "{fill}/{fill}.hd5"
   node: "hfetlumi"
-  #linear_reference: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
-  #input_pattern: "{fill}/{fill}_*.hd5"
-  #node: "bcm1futcalumi"
 
   # order of the poly fit to apply
   order: 3
   
   # Minimum SBIL for including a point in the fit
-  sbil_min: 0.002
+  sbil_min: 0.1
 
   make_plots: True
   save_hd5: False
 
 fills:
- - 8381
+ - 8178
+# - 8128

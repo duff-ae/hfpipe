@@ -196,7 +196,7 @@ def plot_residuals(data, cfg, active_mask, fill, label):
     # ------------------------------------------------------------------
     # Remove meaningless low-SBIL points
     # ------------------------------------------------------------------
-    sbil_min = 0.1
+    sbil_min = cfg.type1.sbil_min # TODO possibly use a dedicated field
 
     finite1 = np.isfinite(avg_col) & np.isfinite(type1_pct) & (avg_col > sbil_min)
     finite2 = np.isfinite(avg_col) & np.isfinite(type2_pct) & (avg_col > sbil_min)
@@ -263,7 +263,7 @@ def plot_residuals(data, cfg, active_mask, fill, label):
         if y.size == 0:
             return (-0.25, 0.25)
 
-        y_abs = np.max(np.abs(y))
+        y_abs = np.quantile(np.abs(y), .99)
         y_lim = max(0.25, 1.15 * y_abs)
 
         # avoid absurdly tiny limits
@@ -277,6 +277,8 @@ def plot_residuals(data, cfg, active_mask, fill, label):
 
         ymin, ymax = _compute_ylim(yvals)
         ax.set_ylim(ymin, ymax)
+
+        #ax.set_xlim(-.01, .15) # TODO remove
 
         ax.axhline(0.0, linestyle="-", linewidth=1.0)
         ax.axhline(+0.2, linestyle="--", linewidth=1.0)

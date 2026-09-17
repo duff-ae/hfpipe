@@ -28,6 +28,10 @@ from .config import PipelineConfig
 
 log = logging.getLogger("hfpipe")
 
+def sort_dict_of_arrays(data, keys=["runnum", "lsnum", "nbnum"]):
+    idx = np.lexsort(tuple(data[k] for k in reversed(keys)))
+    return {k: v[idx] for k, v in data.items()}
+
 def _align_aux_by_keys(
     main: Dict[str, np.ndarray],
     aux: Dict[str, np.ndarray],
@@ -765,6 +769,9 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
     # --- 1) load input data (may contain multiple files and multiple fills) ---
     data = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.io.node)
     
+    # sort by runnum, lsnum, nbnum before extracting hists
+    data = sort_dict_of_arrays(data)
+
     # columns used for merging two tables together
     merge_cols = ['fillnum', 'runnum', 'lsnum', 'nbnum']
 
@@ -787,18 +794,19 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
     # add the reference data for the bunch train correction (if needed)
     if cfg.steps.bunch_train:
         ref = load_hd5_to_arrays(cfg.bunch_train.linear_reference, cfg.bunch_train.input_pattern.format(fill=fill), node=cfg.bunch_train.node)
-
-        if data["timestampsec"].size != ref["timestampsec"].size:
-            log.warning(
-                "[run_fill] fill %d: reference luminometer data not present for %d entries. Dropping rows...",
-                fill,
-                data["timestampsec"].size - ref["timestampsec"].size,
-            )
+        before = data["timestampsec"].size
 
         if not _is_unique_columns([ref[c] for c in merge_cols]):
             raise ValueError(f"{merge_cols} values are not unique. Choose another column to merge on.")
 
         data = _inner_merge_one_column(data, ref, merge_cols, "bxraw", "bxraw_ref")
+        
+        if data["timestampsec"].size != before:
+            log.warning(
+                "[run_fill] fill %d: reference luminometer data not present for %d entries. Dropping rows...",
+                fill,
+                before - data["timestampsec"].size,
+            )
     
 
     # --- 1a) keep only rows corresponding to the current fill ---
@@ -848,11 +856,25 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
 
     # filter out any nans TODO is this physically correct?
     if not np.all(np.isfinite(data['bxraw'])):
+        mask = np.all(np.isfinite(data['bxraw']), axis=-1)
+        n_before = mask.size
+        n_after = int(mask.sum())
         log.warning(
-            "[run_fill] fill %d: nan values found in data. Replacing with 0...",
+            "[run_fill] fill %d: nan values found in data -> kept %d of %d rows",
             fill,
+            n_after,
+            n_before
         )
-        np.nan_to_num(data['bxraw'], copy=False, posinf=0.0, neginf=0.0)
+        for key, arr in data.items():
+            if isinstance(arr, np.ndarray) and arr.shape[0] == n_before:
+                data[key] = arr[mask]
+
+    # TODO temporary
+    #mask = (data['runnum'] != 380196)
+    #n_before = mask.size
+    #for key, arr in data.items():
+    #    if isinstance(arr, np.ndarray) and arr.shape[0] == n_before:
+    #        data[key] = arr[mask]
 
 
     # --- 2) pipeline steps ---
@@ -866,6 +888,23 @@ def run_fill(fill: int, cfg: PipelineConfig) -> None:
             fill=fill,
             input_pattern=input_name,
         )
+
+    # remove any negatives in the uncorrected data TODO is this correct?
+    if False:#not np.all(np.mean(data['bxraw'], axis=-1) >= 0):
+        mask = np.mean(data['bxraw'], axis=-1) >= 0
+        n_before = mask.size
+        n_after = int(mask.sum())
+        log.warning(
+            "[run_fill] fill %d: negative values found in uncorrected data -> kept %d of %d rows",
+            fill,
+            n_after,
+            n_before
+        )
+        for key, arr in data.items():
+            if isinstance(arr, np.ndarray) and arr.shape[0] == n_before:
+                data[key] = arr[mask]
+
+
 
     # plot the uncorrected rates
     # TODO also need to tell the plot which year this is

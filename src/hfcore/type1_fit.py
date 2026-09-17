@@ -206,7 +206,7 @@ def compute_type1_coeffs(
         orders[off] = order
 
         # TODO apply corrections in reverse?
-        for ibx in reversed(range(0, BX_LEN - off)):
+        for ibx in range(0, BX_LEN - off):
             if active_mask[ibx] != 1:
                 continue
             y = bxraw[:, ibx]

@@ -23,11 +23,29 @@ io:
   type1_dir: "/eos/user/l/leeja/HF/plots_hfpipe/OC/24"
 
 steps:
-  revert_online: false
-  restore_rates: true
-  compute_type1: true
-  apply_type1:   true
-  bunch_train:   true
+  online_recovery: false
+  restore_rates:   true
+  compute_type1:   true
+  apply_type1:     true
+  bunch_train:     true
+
+online_recovery:
+  method: "online" # can be either "tables" or "online"
+
+  # for tables recovery
+  afterglow_node: null
+
+  # for online recovery
+  hfsbr_pattern: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Aug10_22.txt"
+
+  # online type 1
+  # these were in effect from Apr 24, 2024 to Nov 05, 2024
+  linear_type1: [0., 0., 0.]
+  quad_type1: [0., 0., 0.]
+
+  # online pedestal
+  # set to null if there is no online pedestal
+  pedestal_node: null
 
 afterglow:
 
@@ -63,12 +81,9 @@ type1:
 
 bunch_train:
   # location of data to use as a linear reference for the bunch train effect
-  linear_reference: "/eos/cms/store/group/dpg_bril/comm_bril/2024/reprocessed/hfet_tmp"
+  linear_reference: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/24_final/"
   input_pattern: "{fill}/{fill}_*.hd5"
   node: "hfetlumi"
-  #linear_reference: "/eos/cms/store/group/dpg_bril/comm_bril/2025/physics"
-  #input_pattern: "{fill}/{fill}_*.hd5"
-  #node: "bcm1futcalumi"
 
   # order of the poly fit to apply
   order: 3
@@ -78,18 +93,6 @@ bunch_train:
 
   make_plots: True
   save_hd5: False
-
-online:
-  # for restoring rates from online
-  hfsbr: "/home/leeja/hfpipe/input/afterglow/hfoc_online_Aug10_22.txt"
-
-  # online type 1
-  linear_type1: [0., 0., 0.]
-  quad_type1: [0., 0., 0.]
-
-  # online pedestal
-  # set to null if there is no online pedestal
-  pedestal_table: null
 
 fills:
   - 9400
