@@ -9,14 +9,14 @@ import numpy as np
 import tables as pt
 from pathlib import Path
 
-SHORT_BASE = "/cephfs/brilshare/alshevel/l1scouting_muon2"
-DONOR_BASE = "/eos/cms/store/group/dpg_bril/comm_bril/2024/online/per-bcid/"
+SHORT_BASE = "/eos/cms/store/group/dpg_bril/comm_bril/2023/raw/hfet/23/"
+DONOR_BASE = "/eos/cms/store/group/dpg_bril/comm_bril/2023/online/per-bcid/"
 
 # Donor and short tables are NOT the same node name -- donor (the official
 # online per-bcid files) uses "hfetlumi" regardless of which detector's
 # scouting data it's paired with; our own converted files use "l1scoutlumi".
 DONOR_NODE = "/hfetlumi"
-SHORT_NODE = "/l1scoutlumi"
+SHORT_NODE = "/hfetlumi"
 
 # Donor filenames are "<fill>_<run>_<start>_<end>.hd5" -- <run> is matched
 # as an exact underscore-bounded numeric field, not a loose substring, so a

@@ -11,12 +11,21 @@ import json
 import re
 
 from .decorators import log_step, timeit
+from .hd5schema import BX_LEN
+
 from .io import (
     load_hd5_to_arrays,
     iter_hd5_row_chunks,
     Hd5ChunkWriter,
+    load_active_mask,
+    align_aux_by_keys,
 )
-from .hd5schema import BX_LEN
+
+from .pedestal import (
+    calculate_dynamic_pedestal,
+    subtract_fixed_pedestal_mod4_inplace,
+)
+
 from .afterglow_lsq import build_afterglow_solver_from_file, AfterglowSolver
 from .type1_fit import (
     save_type1_coeffs,
@@ -46,71 +55,7 @@ from .config import PipelineConfig
 
 log = logging.getLogger("hfpipe")
 
-DEFAULT_CHUNK_SIZE = 500
-
-
-def _align_aux_by_keys(
-    main: Dict[str, np.ndarray],
-    aux: Dict[str, np.ndarray],
-    colname: str,
-) -> np.ndarray:
-
-    keys = ("fillnum", "runnum", "lsnum", "nbnum")
-
-    T = main[keys[0]].shape[0]
-    main_key = np.stack([main[k].astype(np.int64) for k in keys], axis=1)  # (T, 4)
-
-    aux_T = aux[keys[0]].shape[0]
-    aux_key = np.stack([aux[k].astype(np.int64) for k in keys], axis=1)    # (aux_T, 4)
-
-    index: Dict[tuple, int] = {}
-    for j in range(aux_T):
-        index[tuple(aux_key[j])] = j
-
-    aux_col = aux[colname]
-    tail_shape = aux_col.shape[1:]
-
-    out = np.zeros((T,) + tail_shape, dtype=aux_col.dtype)
-
-    missing = 0
-    for i in range(T):
-        key = tuple(main_key[i])
-        j = index.get(key, None)
-        if j is None:
-            missing += 1
-            continue
-        out[i] = aux_col[j]
-
-    if missing > 0:
-        print(f"[WARN] _align_aux_by_keys: {missing} rows had no match in aux node")
-
-    return out
-
-
-def _subtract_fixed_pedestal_mod4_inplace(data: dict, ped4) -> None:
-    """
-    Subtract constant mod4 pedestal from bxraw only:
-      bxraw[:, bx] -= ped4[bx % 4]
-
-    Purely elementwise -- works on a full-fill dict or a single chunk.
-    """
-    if ped4 is None:
-        return
-
-    if "bxraw" not in data:
-        raise KeyError("fixed_pedestal_4 is set but data has no 'bxraw'")
-
-    ped4 = np.asarray(ped4, dtype=np.float32).ravel()
-    if ped4.shape[0] != 4:
-        raise ValueError(f"fixed_pedestal_4 must have length 4, got shape {ped4.shape}")
-
-    bxraw = np.asarray(data["bxraw"])
-    if bxraw.ndim != 2 or bxraw.shape[1] != BX_LEN:
-        raise ValueError(f"bxraw has shape {bxraw.shape}, expected (T, {BX_LEN})")
-
-    ped_vec = ped4[np.arange(BX_LEN) % 4][None, :]  # (1, BX_LEN)
-    data["bxraw"] = (bxraw - ped_vec).astype(bxraw.dtype, copy=False)
-
+DEFAULT_CHUNK_SIZE = 250
 
 def _recompute_derived_from_bxraw_inplace(
     data: dict,
@@ -242,7 +187,7 @@ def _recover_online_chunk(
     the histogram before the online pedestal/afterglow corrections.
 
     Auxiliary table alignment deliberately uses the original
-    ``_align_aux_by_keys`` helper; no assumptions are made about row/chunk
+    ``align_aux_by_keys`` helper; no assumptions are made about row/chunk
     ordering between HDF5 nodes.
     """
     bxraw_final = np.asarray(chunk["bxraw"], dtype=np.float32)
@@ -253,10 +198,10 @@ def _recover_online_chunk(
                 "online_recovery method='tables' requires pedestal and afterglow tables"
             )
 
-        pedestal_4 = _align_aux_by_keys(
+        pedestal_4 = align_aux_by_keys(
             main=chunk, aux=pedestal_data, colname="bxraw"
         ).astype(np.float32)
-        afterglow_frac = _align_aux_by_keys(
+        afterglow_frac = align_aux_by_keys(
             main=chunk, aux=afterglow_data, colname="bxraw"
         ).astype(np.float32)
 
@@ -281,25 +226,6 @@ def _recover_online_chunk(
     out = dict(chunk)
     out["bxraw"] = result.recovered_raw
     return out
-
-
-def calculate_dynamic_pedestal(mu_hist: np.ndarray) -> np.ndarray:
-    """
-    Exact copy of CMS dynamic pedestal logic.
-
-    We take the last 13*4 BXs (3500..3500+4*13-1 = 3500..3551),
-    group them by HF subdetector (0..3), and return pedestal[4].
-    """
-    n_sample = 13
-    pedestal = np.zeros(4, dtype=np.float32)
-    base = 3500
-    for ibx in range(4):
-        s = 0.0
-        for j in range(ibx, 4 * n_sample, 4):
-            s += mu_hist[base + j]
-        pedestal[ibx] = s / n_sample
-    return pedestal
-
 
 # ---------------------------------------------------------------------------
 # Tiny generic row-series accumulator (O(T) memory, independent of BX_LEN)
@@ -522,7 +448,7 @@ def _pass0_prepare(
 
             if cfg.steps.restore_rates:
                 if ped4 is not None:
-                    _subtract_fixed_pedestal_mod4_inplace(chunk, ped4)
+                    subtract_fixed_pedestal_mod4_inplace(chunk, ped4)
 
                 chunk = restore_rates_chunk(
                     chunk, active_mask, solver, warm_state,
@@ -771,8 +697,7 @@ def run_fill(
     if not os.path.exists(mask_path):
         raise FileNotFoundError(f"Active BX mask not found: {mask_path}")
 
-    with open(mask_path, "r") as f:
-        active_mask = json.load(f)
+    active_mask = load_active_mask(mask_path, expected_len=BX_LEN)
     active_mask = np.asarray(active_mask, dtype=np.int32)
 
     if active_mask.ndim != 1:

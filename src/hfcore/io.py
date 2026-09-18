@@ -434,3 +434,93 @@ class Hd5ChunkWriter:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+def load_active_mask(path: str, expected_len: Optional[int] = None) -> np.ndarray:
+    """Load and validate an active-BX mask from JSON or NPY."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Active BX mask not found: {path}")
+
+    if path.lower().endswith(".npy"):
+        mask = np.load(path)
+    else:
+        import json
+        with open(path, "r") as f:
+            mask = json.load(f)
+
+    mask = np.asarray(mask, dtype=np.int32)
+
+    if mask.ndim != 1:
+        raise ValueError(
+            f"Active BX mask must be one-dimensional, got shape {mask.shape}"
+        )
+
+    if expected_len is not None and mask.size != expected_len:
+        raise ValueError(
+            f"active_mask len={mask.size} != expected_len={expected_len}"
+        )
+
+    if not np.all((mask == 0) | (mask == 1)):
+        bad = np.unique(mask[(mask != 0) & (mask != 1)])
+        raise ValueError(
+            f"Active BX mask must contain only 0 and 1, found: {bad.tolist()}"
+        )
+
+    return mask
+
+
+def align_aux_by_keys(
+    main: Dict[str, np.ndarray],
+    aux: Dict[str, np.ndarray],
+    colname: str,
+    keys=("fillnum", "runnum", "lsnum", "nbnum"),
+) -> np.ndarray:
+    """Align an auxiliary table column to main rows by BRIL row keys."""
+
+    for key in keys:
+        if key not in main:
+            raise KeyError(f"main data has no alignment key {key!r}")
+        if key not in aux:
+            raise KeyError(f"aux data has no alignment key {key!r}")
+
+    if colname not in aux:
+        raise KeyError(f"aux data has no column {colname!r}")
+
+    main_key = np.stack(
+        [np.asarray(main[k], dtype=np.int64) for k in keys],
+        axis=1,
+    )
+    aux_key = np.stack(
+        [np.asarray(aux[k], dtype=np.int64) for k in keys],
+        axis=1,
+    )
+
+    index = {
+        tuple(aux_key[j]): j
+        for j in range(aux_key.shape[0])
+    }
+
+    aux_col = np.asarray(aux[colname])
+
+    out = np.zeros(
+        (main_key.shape[0],) + aux_col.shape[1:],
+        dtype=aux_col.dtype,
+    )
+
+    missing = 0
+
+    for i, key in enumerate(main_key):
+        j = index.get(tuple(key))
+
+        if j is None:
+            missing += 1
+            continue
+
+        out[i] = aux_col[j]
+
+    if missing:
+        print(
+            f"[WARN] align_aux_by_keys: "
+            f"{missing} rows had no match in aux node"
+        )
+
+    return out

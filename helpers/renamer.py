@@ -2,7 +2,7 @@ import os
 import numpy as np
 import tables as pt
 
-base = "/cephfs/brilshare/alshevel/hf_origin/hfet/23_fixed"
+base = "/eos/cms/store/group/dpg_bril/comm_bril/2023/raw/hfet/23_recovered"
 
 fill_list = sorted([int(fill) for fill in os.listdir(base)])
 
@@ -15,8 +15,8 @@ for fill in fill_list:
         continue
 
     
-    if int(fill) <= 8741:
-        continue
+    #if int(fill) <= 8741:
+    #    continue
 
     print("fix", f)
 

@@ -105,21 +105,16 @@ def apply_type1_batch(
     # }
     #
     # Here we do the same in Python/NumPy.
-    for ibx in range(0, N - (type_len + 1) + 1):
+    for ibx in range(N - 1):
         if active_mask[ibx] != 1:
             continue
 
-        # y for ALL events in this colliding BX: shape (T,)
-        y = out[:, ibx]
-        y2 = y * y
+        y = out[:, ibx].copy()
 
-        # Loop over all offsets t = 0..type_len
-        for t in range(type_len + 1):
-            j = ibx + t
-            # poly(y) = p0[t] + p1[t] * y + p2[t] * y^2
-            poly = p0[t] + p1[t] * y + p2[t] * y2
-            # subtract the Type-1 contribution for all events at BX j
-            out[:, j] -= y * poly
+        extra = y * (p0[1] + p1[1] * y + p2[1] * y * y)
+
+        out[:, ibx + 1] -= extra
+        out[:, ibx] -= y * p0[1]
 
     return out
 
