@@ -1,20 +1,16 @@
-# src/hfcore/online_recovery.py
-
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
+import re
 
+import h5py
 import numpy as np
 
 from .hd5schema import BX_LEN
 
 log = logging.getLogger("hfpipe")
-
-try:
-    from tqdm.auto import tqdm
-except Exception:
-    tqdm = None
 
 try:
     from cffi import FFI
@@ -25,7 +21,7 @@ except Exception as e:
 
 
 # ----------------------------------------------------------------------
-# C backend
+# Exact online afterglow inverse
 # ----------------------------------------------------------------------
 
 _ffi = FFI()
@@ -81,9 +77,28 @@ _C = _ffi.verify(
 )
 
 
+@dataclass
+class OnlineRecoveryResult:
+    """
+    Common output of both online-recovery methods.
+
+    recovered_raw:
+        Histogram before the online afterglow/pedestal corrections.
+        Shape (T, BX_LEN).
+
+    pedestal:
+        Four per-row pedestal components, indexed by BX % 4.
+        Shape (T, 4).
+    """
+
+    recovered_raw: np.ndarray
+    pedestal: np.ndarray
+
+
 # ----------------------------------------------------------------------
-# Helpers
+# Validation / conversion helpers
 # ----------------------------------------------------------------------
+
 
 def _validate_bx_hist_2d(name: str, arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr)
@@ -105,7 +120,9 @@ def _validate_active_mask(active_mask: np.ndarray) -> np.ndarray:
         raise ValueError(
             f"active_mask has length {active.shape[0]}, expected {BX_LEN}"
         )
-    return active
+    if not np.all((active == 0) | (active == 1)):
+        raise ValueError("active_mask must contain only 0/1 values")
+    return np.ascontiguousarray(active, dtype=np.int32)
 
 
 def _validate_hfsbr(hfsbr: np.ndarray) -> np.ndarray:
@@ -114,19 +131,25 @@ def _validate_hfsbr(hfsbr: np.ndarray) -> np.ndarray:
         raise ValueError(
             f"hfsbr length {hfsbr.shape[0]} is smaller than BX_LEN={BX_LEN}"
         )
-    return hfsbr
+    return np.ascontiguousarray(hfsbr, dtype=np.float32)
 
 
-def _make_progress(iterable, *, enabled: bool, desc: str, total: int | None = None):
-    if enabled and tqdm is not None:
-        return tqdm(iterable, desc=desc, total=total)
-    return iterable
+def _validate_zero_bx(zero_bx) -> np.ndarray:
+    zero = np.asarray(tuple(zero_bx), dtype=np.int64).ravel()
+    if zero.size < 4:
+        raise ValueError(
+            f"At least 4 artificial zero BX are required, got {zero.size}"
+        )
+    if np.any((zero < 0) | (zero >= BX_LEN)):
+        raise ValueError(f"zero_bx contains values outside [0, {BX_LEN - 1}]")
+    if np.unique(zero).size != zero.size:
+        raise ValueError("zero_bx contains duplicates")
+    return zero
 
 
 def _as_c_float32_1d(name: str, arr: np.ndarray) -> np.ndarray:
     arr = np.ascontiguousarray(arr, dtype=np.float32)
-    arr = _validate_bx_hist_1d(name, arr)
-    return arr
+    return _validate_bx_hist_1d(name, arr)
 
 
 def _call_revert_afterglow_inplace(
@@ -145,39 +168,104 @@ def _call_revert_afterglow_inplace(
     )
 
 
-def _call_subtract_pedestal_inplace(
-    mu_hist_f32: np.ndarray,
-    pedestal_f32: np.ndarray,
-) -> None:
-    _C.subtract_pedestal(
-        _ffi.cast("float *", _ffi.from_buffer(mu_hist_f32)),
-        _ffi.cast("float *", _ffi.from_buffer(pedestal_f32)),
-    )
+def apply_revert_afterglow_batch(
+    hist: np.ndarray,
+    hfsbr: np.ndarray,
+    linear: np.ndarray,
+    quad: np.ndarray,
+    active_mask: np.ndarray,
+) -> np.ndarray:
+    """Apply the exact C-style afterglow inverse independently to each row."""
+
+    hist = _validate_bx_hist_2d("hist", np.asarray(hist, dtype=np.float32))
+    hfsbr_f32 = _validate_hfsbr(hfsbr)
+    active_i32 = _validate_active_mask(active_mask)
+    linear_f32 = np.asarray(linear, dtype=np.float32).ravel()
+    quad_f32 = np.asarray(quad, dtype=np.float32).ravel()
+
+    out = np.empty_like(hist, dtype=np.float32)
+    for i in range(hist.shape[0]):
+        row = _as_c_float32_1d("hist row", hist[i]).copy()
+        _call_revert_afterglow_inplace(active_i32, row, linear_f32, quad_f32, hfsbr_f32)
+        out[i] = row
+    return out
 
 
 # ----------------------------------------------------------------------
-# Method A: reconstruction using extra tables
+# HFSBR loading
 # ----------------------------------------------------------------------
+
+
+def load_hfsbr_file(path: str | Path) -> np.ndarray:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"HFSBR file not found: {path}")
+
+    suffix = path.suffix.lower()
+
+    if suffix == ".npy":
+        arr = np.load(path)
+        return _validate_hfsbr(arr)
+
+    if suffix in (".txt", ".dat"):
+        text = path.read_text()
+        text = text.replace("[", " ").replace("]", " ")
+        values = []
+        for tok in re.split(r"[,\s]+", text):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                values.append(float(tok))
+            except ValueError:
+                continue
+        if not values:
+            raise RuntimeError(f"HFSBR file {path} did not contain numeric values")
+        return _validate_hfsbr(np.asarray(values, dtype=np.float32))
+
+    if suffix in (".h5", ".hd5"):
+        with h5py.File(path, "r") as h5:
+            if "hfsbr" in h5:
+                return _validate_hfsbr(np.asarray(h5["hfsbr"][:], dtype=np.float32))
+            for obj in h5.values():
+                if hasattr(obj, "shape"):
+                    return _validate_hfsbr(np.asarray(obj[...], dtype=np.float32))
+        raise RuntimeError(f"Could not find an HFSBR dataset in {path}")
+
+    raise RuntimeError(f"Unsupported HFSBR file format: {path}")
+
+
+# ----------------------------------------------------------------------
+# Method A: authoritative recovery from saved online tables
+# ----------------------------------------------------------------------
+
 
 def reconstruct_from_tables_batch(
     bxraw_final: np.ndarray,
     pedestal_4: np.ndarray,
     afterglow_frac: np.ndarray,
-):
+    *,
+    zero_bx=(3553, 3554, 3555, 3556, 3557),
+) -> OnlineRecoveryResult:
     """
-    Reconstruct using hfEtPedestal and hfafterglowfrac.
+    Authoritative table-based recovery.
 
-    Interpretation kept consistent with previous code:
-      - mu_after  = bxraw_final + pedestal
-      - mu_before = mu_after / afterglow_frac   where frac > 0
+      pre_pedestal = bxraw_final + pedestal[BX % 4]
+      recovered_raw = pre_pedestal / afterglow_frac
+
+    The artificial zero BX have no valid afterglow fraction in the saved
+    table. They are known by construction to be exactly zero in recovered_raw.
+    Any other invalid fraction is treated as an error rather than silently
+    creating a corrupted histogram.
     """
-    bxraw_final = np.asarray(bxraw_final, dtype=np.float64)
+
+    bxraw_final = _validate_bx_hist_2d(
+        "bxraw_final", np.asarray(bxraw_final, dtype=np.float64)
+    )
     pedestal_4 = np.asarray(pedestal_4, dtype=np.float64)
     afterglow_frac = np.asarray(afterglow_frac, dtype=np.float64)
 
-    bxraw_final = _validate_bx_hist_2d("bxraw_final", bxraw_final)
-
-    T, _ = bxraw_final.shape
+    T = bxraw_final.shape[0]
     if pedestal_4.shape != (T, 4):
         raise ValueError(f"pedestal_4 shape {pedestal_4.shape}, expected ({T}, 4)")
     if afterglow_frac.shape != (T, BX_LEN):
@@ -185,117 +273,125 @@ def reconstruct_from_tables_batch(
             f"afterglow_frac shape {afterglow_frac.shape}, expected ({T}, {BX_LEN})"
         )
 
+    zero = _validate_zero_bx(zero_bx)
+    zero_mask = np.zeros(BX_LEN, dtype=bool)
+    zero_mask[zero] = True
+
     idx_mod4 = np.arange(BX_LEN) % 4
+    pre_pedestal = bxraw_final + pedestal_4[:, idx_mod4]
 
-    mu_after = np.empty_like(bxraw_final, dtype=np.float64)
-    mu_before = np.zeros_like(bxraw_final, dtype=np.float64)
+    valid = np.isfinite(afterglow_frac) & (afterglow_frac > 0.0)
 
-    for i in range(T):
-        ped_pattern = pedestal_4[i][idx_mod4]
-        mu_after[i] = bxraw_final[i] + ped_pattern
+    recovered = np.full_like(
+        pre_pedestal,
+        np.nan,
+        dtype=np.float64,
+    )
 
-        mask = afterglow_frac[i] > 0.0
-        mu_before[i, mask] = mu_after[i, mask] / afterglow_frac[i, mask]
+    recovered[valid] = (
+        pre_pedestal[valid]
+        / afterglow_frac[valid]
+    )
 
-    return mu_before.astype(np.float32)
+    recovered[:, zero_bx] = 0.0
+
+    recovered = np.zeros_like(pre_pedestal, dtype=np.float64)
+    recovered[valid] = pre_pedestal[valid] / afterglow_frac[valid]
+    recovered[:, zero] = 0.0
+
+    return OnlineRecoveryResult(
+        recovered_raw=recovered.astype(np.float32),
+        pedestal=pedestal_4.astype(np.float32),
+    )
 
 
 # ----------------------------------------------------------------------
-# Method B: exact C-style online reconstruction
+# Method B: recovery without saved tables
 # ----------------------------------------------------------------------
 
-def reconstruct_single_hist_online(
-    bxraw_final: np.ndarray,
-    hfsbr: np.ndarray,
-    linear: np.ndarray,
-    quad: np.ndarray,
-    pedestal: np.ndarray,
-    active_mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+class OnlineRecoverySolver:
     """
-    Exact C-style sequence for one histogram:
+    Recover the four per-row pedestal values from the artificial zero BX,
+    then invert the online afterglow operation.
 
-      input histogram = bxraw_final
-      1) revert_afterglow(mu)
-      2) save mu_after = reverted histogram before pedestal subtraction
-      3) subtract_pedestal(mu, pedestal)
-      4) save mu_before = final corrected histogram
-
-    No fit, no zero_bx constraints, no iteration.
+    The response matrix depends only on HFSBR, active mask and zero-BX
+    positions, so it is constructed once per fill. The RHS and therefore the
+    fitted pedestal are recomputed independently for every histogram row.
     """
-    mu = _as_c_float32_1d("bxraw_final", bxraw_final).copy()
-    hfsbr_f32 = _validate_hfsbr(hfsbr)
-    linear_f32 = np.asarray(linear, dtype=np.float32).ravel()
-    quad_f32 = np.asarray(quad, dtype=np.float32).ravel()
-    active_i32 = _validate_active_mask(active_mask)
+    def __init__(
+        self,
+        hfsbr: np.ndarray,
+        active_mask: np.ndarray,
+        *,
+        linear=[0, 0, 0, 0],
+        quad=[0, 0, 0, 0],
+        zero_bx=(3553, 3554, 3555, 3556, 3557),
+    ) -> None:
+        self.hfsbr = _validate_hfsbr(hfsbr)
+        self.active_mask = _validate_active_mask(active_mask)
+        self.zero_bx = _validate_zero_bx(zero_bx)
+        self.linear = np.asarray(linear, dtype=np.float32).ravel()
+        self.quad = np.asarray(quad, dtype=np.float32).ravel()
 
-    _call_revert_afterglow_inplace(
-        active_mask_i32=active_i32,
-        mu_hist_f32=mu,
-        linear_f32=linear_f32,
-        quad_f32=quad_f32,
-        hfsbr_f32=hfsbr_f32,
-    )
+        self.response = self._build_pedestal_response().astype(np.float64)
+        self.A = self.response[:, self.zero_bx].T
 
-    if pedestal is None:
-        pedestal = np.zeros(4, dtype=np.float32)
+        self.rank = int(np.linalg.matrix_rank(self.A))
+        self.condition = float(np.linalg.cond(self.A))
+        if self.rank < 4:
+            raise RuntimeError(
+                "Artificial-zero pedestal system has rank < 4: "
+                f"shape={self.A.shape}, rank={self.rank}"
+            )
 
-    _call_subtract_pedestal_inplace(
-        mu_hist_f32=mu,
-        pedestal_f32=pedestal,
-    )
+        self.A_pinv = np.linalg.pinv(self.A)
 
-    mu_before = mu
-
-    return mu_before
-
-
-def reconstruct_from_online_batch(
-    bxraw_final: np.ndarray,
-    hfsbr: np.ndarray,
-    linear: np.ndarray,
-    quad: np.ndarray,
-    pedestal: np.ndarray,
-    active_mask: np.ndarray,
-    zero_bx: tuple[int, ...] = (3553, 3554, 3555, 3556, 3557),  # kept for API compatibility
-    n_iter: int = 0,                                             # kept for API compatibility
-    step: float = 0.0,                                           # kept for API compatibility
-    show_progress: bool = False,
-):
-    """
-    Batch wrapper around exact per-histogram C-style reconstruction.
-
-    Note:
-      zero_bx / n_iter / step are ignored intentionally.
-      They are kept only so the existing pipeline call site does not break.
-    """
-    bxraw_final = np.asarray(bxraw_final, dtype=np.float32)
-    bxraw_final = _validate_bx_hist_2d("bxraw_final", bxraw_final)
-
-    hfsbr = _validate_hfsbr(hfsbr)
-    active_mask = _validate_active_mask(active_mask)
-
-    T, _ = bxraw_final.shape
-
-    mu_before_all = np.zeros_like(bxraw_final, dtype=np.float32)
-
-    row_iter = _make_progress(
-        range(T),
-        enabled=show_progress,
-        desc="Online recovery (C-style)",
-        total=T,
-    )
-
-    for i in row_iter:
-        mu_before_i = reconstruct_single_hist_online(
-            bxraw_final=bxraw_final[i],
-            hfsbr=hfsbr,
-            linear=linear,
-            quad=quad,
-            pedestal=(pedestal[i] if pedestal is not None else None),
-            active_mask=active_mask,
+        log.info(
+            "[online_recovery] zero-BX pedestal system shape=%s rank=%d condition=%.6e",
+            self.A.shape,
+            self.rank,
+            self.condition,
         )
 
-        mu_before_all[i] = mu_before_i
+    def _build_pedestal_response(self) -> np.ndarray:
+        response = np.empty((4, BX_LEN), dtype=np.float32)
+        bx_mod4 = np.arange(BX_LEN) % 4
 
-    return mu_before_all
+        for k in range(4):
+            row = np.ascontiguousarray((bx_mod4 == k).astype(np.float32))
+            _call_revert_afterglow_inplace(self.active_mask, row, self.linear, self.quad, self.hfsbr)
+            response[k] = row
+
+        return response
+
+    def recover_batch(self, bxraw_final: np.ndarray) -> OnlineRecoveryResult:
+        bxraw_final = _validate_bx_hist_2d(
+            "bxraw_final", np.asarray(bxraw_final, dtype=np.float32)
+        )
+
+        # R(final) is row dependent and therefore evaluated for every row.
+        base = apply_revert_afterglow_batch(
+            bxraw_final,
+            hfsbr=self.hfsbr,
+            linear=self.linear,
+            quad=self.quad,
+            active_mask=self.active_mask,
+        ).astype(np.float64)
+
+        # For every row i solve
+        #     A p_i = -R(final_i)[zero_bx]
+        rhs = -base[:, self.zero_bx]
+        pedestal = rhs @ self.A_pinv.T
+
+        # By linearity:
+        # R(final + pedestal_pattern) = R(final) + p @ R(pattern_k)
+        recovered = base + pedestal @ self.response
+
+        # These bins are software-injected zeros before any online operation;
+        # enforce the known exact state explicitly in the recovered histogram.
+        recovered[:, self.zero_bx] = 0.0
+
+        return OnlineRecoveryResult(
+            recovered_raw=recovered.astype(np.float32),
+            pedestal=pedestal.astype(np.float32),
+        )

@@ -1,97 +1,68 @@
 from __future__ import annotations
 
 import os
-from typing import List
+import shutil
+from typing import Dict, List, Optional
 
 import numpy as np
 import logging
 import h5py
+import json
 import re
-import copy
-import math
-import traceback
-from tqdm import tqdm
-from joblib import Parallel, delayed
 
 from .decorators import log_step, timeit
-from .io import load_hd5_to_arrays, arrays_to_rows, save_to_hd5
 from .hd5schema import BX_LEN
-from .afterglow_lsq import build_afterglow_solver_from_file
-from .type1_fit import compute_type1_coeffs, save_type1_coeffs, analyze_type1_step
+
+from .io import (
+    load_hd5_to_arrays,
+    iter_hd5_row_chunks,
+    Hd5ChunkWriter,
+    load_active_mask,
+    align_aux_by_keys,
+)
+
+from .pedestal import (
+    calculate_dynamic_pedestal,
+    subtract_fixed_pedestal_mod4_inplace,
+)
+
+from .afterglow_lsq import build_afterglow_solver_from_file, AfterglowSolver
+from .type1_fit import (
+    save_type1_coeffs,
+    Type1OffsetAccumulator,
+    accumulate_type1_offset_chunk,
+    subtract_type1_offset_inplace,
+    get_sbil_like_column,
+    analyze_type1_fill_chunked,
+)
 from .type1_apply import apply_type1_batch
-from .bunch_train import compute_bunch_train_coeffs, save_bunch_train_coeffs, analyze_bunch_train_step, apply_bunch_train_batch
-from .online_recovery import reconstruct_from_tables_batch, reconstruct_from_online_batch
-from .plotter import plot_hist_bx, plot_lumi_comparison, plot_residuals, plot_lasers
+from .bunch_train import (
+    save_bunch_train_coeffs,
+    apply_bunch_train_batch,
+    BunchTrainAccumulator,
+    accumulate_bunch_train_chunk,
+    analyze_bunch_train_fill_chunked,
+)
+from .online_recovery import reconstruct_from_tables_batch, OnlineRecoverySolver
+from .plotter import (
+    BxProfileAccumulator,
+    plot_hist_bx_from_profile,
+    compute_scaled_active_sum_chunk,
+    plot_lumi_comparison_from_series,
+    build_residual_masks,
+    compute_residual_row_averages,
+    plot_residuals_finalize,
+    compute_laser_columns_chunk,
+    plot_lasers_from_series,
+    LASER_BCID,
+)
 
 from .config import PipelineConfig
 
 
 log = logging.getLogger("hfpipe")
 
-def sort_dict_of_arrays(data, keys=["runnum", "lsnum", "nbnum"]):
-    idx = np.lexsort(tuple(data[k] for k in reversed(keys)))
-    return {k: v[idx] for k, v in data.items()}
-
-def _align_aux_by_keys(
-    main: Dict[str, np.ndarray],
-    aux: Dict[str, np.ndarray],
-    colname: str,
-) -> np.ndarray:
-
-    keys = ("fillnum", "runnum", "lsnum", "nbnum")
-
-    T = main[keys[0]].shape[0]
-    main_key = np.stack([main[k].astype(np.int64) for k in keys], axis=1)  # (T, 4)
-
-    aux_T = aux[keys[0]].shape[0]
-    aux_key = np.stack([aux[k].astype(np.int64) for k in keys], axis=1)    # (aux_T, 4)
-
-    index: Dict[tuple, int] = {}
-    for j in range(aux_T):
-        index[tuple(aux_key[j])] = j
-
-    aux_col = aux[colname]
-    tail_shape = aux_col.shape[1:]
-
-    out = np.zeros((T,) + tail_shape, dtype=aux_col.dtype)
-
-    missing = 0
-    for i in range(T):
-        key = tuple(main_key[i])
-        j = index.get(key, None)
-        if j is None:
-            missing += 1
-            continue
-        out[i] = aux_col[j]
-
-    if missing > 0:
-        print(f"[WARN] _align_aux_by_keys: {missing} rows had no match in aux node")
-
-    return out
-
-def _subtract_fixed_pedestal_mod4_inplace(data: dict, ped4) -> None:
-    """
-    Subtract constant mod4 pedestal from bxraw only:
-      bxraw[:, bx] -= ped4[bx % 4]
-    """
-    if ped4 is None:
-        return
-
-    if "bxraw" not in data:
-        raise KeyError("fixed_pedestal_4 is set but data has no 'bxraw'")
-
-    ped4 = np.asarray(ped4, dtype=np.float32).ravel()
-    if ped4.shape[0] != 4:
-        raise ValueError(f"fixed_pedestal_4 must have length 4, got shape {ped4.shape}")
-
-    bxraw = np.asarray(data["bxraw"])
-    if bxraw.ndim != 2 or bxraw.shape[1] != BX_LEN:
-        raise ValueError(f"bxraw has shape {bxraw.shape}, expected (T, {BX_LEN})")
-
-    ped_vec = ped4[np.arange(BX_LEN) % 4][None, :]  # (1, BX_LEN)
-    data["bxraw"] = (bxraw - ped_vec).astype(bxraw.dtype, copy=False)
-
-    log.info("[fixed_pedestal_4] Subtracted from bxraw (ped4=%s)", ped4.tolist())
+DEFAULT_CHUNK_SIZE = 250
 
 def _recompute_derived_from_bxraw_inplace(
     data: dict,
@@ -104,12 +75,13 @@ def _recompute_derived_from_bxraw_inplace(
       - avgraw  = sum(bxraw over active BX)   (NOT mean)
       - avg     = avgraw * scale
 
-    This must be the single source of truth for bx/avgraw/avg.
+    This must be the single source of truth for bx/avgraw/avg. Works
+    equally on a full-fill dict or a single chunk.
     """
     if "bxraw" not in data:
         raise KeyError("_recompute_derived_from_bxraw_inplace: missing 'bxraw' in data")
 
-    bxraw = np.asarray(data["bxraw"], dtype=np.float64)
+    bxraw = np.asarray(data["bxraw"], dtype=np.float32)
     if bxraw.ndim != 2 or bxraw.shape[1] != BX_LEN:
         raise ValueError(
             f"_recompute_derived_from_bxraw_inplace: bxraw has shape {bxraw.shape}, expected (T, {BX_LEN})"
@@ -124,54 +96,12 @@ def _recompute_derived_from_bxraw_inplace(
     sigvis = getattr(cfg.afterglow, "sigvis", None)
     scale = 1.0 if not sigvis else 11245.6 / float(sigvis)
 
-    # bx (lumi per BX)
-    data["bx"] = (bxraw * scale).astype(np.float64, copy=False)
+    data["bx"] = (bxraw * scale).astype(np.float32, copy=False)
 
-    # avgraw = SUM over active BX (mu-space)
     avgraw = (bxraw * mask[None, :]).sum(axis=1)
-    data["avgraw"] = avgraw.astype(np.float64, copy=False)
+    data["avgraw"] = avgraw.astype(np.float32, copy=False)
 
-    # avg = scaled sum over active BX (lumi-space)
-    data["avg"] = (avgraw * scale).astype(np.float64, copy=False)
-
-
-# ---------------------------------------------------------------------------
-# Helpers for merging tables
-# ---------------------------------------------------------------------------
-
-# for double checking if a column is all unique values
-# sanity check used before merging two tables on a column
-def _is_unique_columns(cols):
-    stacked = np.column_stack(cols)
-    return np.unique(stacked, axis=0).shape[0] == stacked.shape[0]
-
-# for merging one column from a dictionary into another
-# useful for getting the pedestal information
-def _inner_merge_one_column(left, right, on, right_col, new_col_name):
-   # Build structured arrays for keys
-    left_keys = np.core.records.fromarrays([left[c] for c in on], names=",".join(on))
-    right_keys = np.core.records.fromarrays([right[c] for c in on], names=",".join(on))
-
-    # Sort right keys for fast lookup
-    order = np.argsort(right_keys)
-    right_keys_sorted = right_keys[order]
-    right_vals_sorted = right[right_col][order]
-
-    # Find matches
-    idx = np.searchsorted(right_keys_sorted, left_keys)
-    valid = idx < right_keys_sorted.size
-    mask = np.zeros_like(valid, dtype=bool)
-    mask[valid] = right_keys_sorted[idx[valid]] == left_keys[valid]
-
-    # Build merged dict
-    merged = {}
-
-    for k, v in left.items():
-        merged[k] = v[mask]
-
-    merged[new_col_name] = right_vals_sorted[idx[mask]]
-
-    return merged
+    data["avg"] = (avgraw * scale).astype(np.float32, copy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -179,15 +109,6 @@ def _inner_merge_one_column(left, right, on, right_col, new_col_name):
 # ---------------------------------------------------------------------------
 
 def _get_type1_dir(cfg: PipelineConfig) -> str:
-    """
-    Return the directory where Type-1 coefficient files are stored.
-
-    Priority:
-      1) cfg.io.type1_dir if set;
-      2) <output_dir>/type1 as a default.
-
-    Ensures that the directory exists.
-    """
     type1_dir = getattr(cfg.io, "type1_dir", None)
     if type1_dir is None:
         type1_dir = os.path.join(cfg.io.output_dir, "type1")
@@ -196,14 +117,13 @@ def _get_type1_dir(cfg: PipelineConfig) -> str:
 
 
 def _get_type1_coeff_path(cfg: PipelineConfig, fill: int) -> str:
-    """
-    Return the full path to the Type-1 coefficients file for a given fill.
-    """
     type1_dir = _get_type1_dir(cfg)
     return os.path.join(type1_dir, f"type1_coeffs_fill{fill}.h5")
 
+
 # ---------------------------------------------------------------------------
-# Step 0: recover origin rates
+# Step 0: recover origin rates (unchanged; not wired into the pipeline,
+# same as it was commented out before)
 # ---------------------------------------------------------------------------
 def _load_hfsbr_for_online(cfg: PipelineConfig, fill: int) -> np.ndarray:
     pattern = cfg.online_recovery.hfsbr_pattern or cfg.afterglow.hfsbr_pattern
@@ -217,20 +137,15 @@ def _load_hfsbr_for_online(cfg: PipelineConfig, fill: int) -> np.ndarray:
     if not os.path.exists(path):
         raise FileNotFoundError(f"HFSBR file for online recovery not found: {path}")
 
-    # 1) .npy
     if path.endswith(".npy"):
         arr = np.load(path)
         return np.asarray(arr, dtype=np.float64).ravel()
 
-    # 2) .txt / .dat
     if path.endswith(".txt") or path.endswith(".dat"):
         with open(path, "r") as f:
             text = f.read()
-
         text = text.replace("[", " ").replace("]", " ")
-
         tokens = re.split(r"[,\s]+", text)
-
         values = []
         for tok in tokens:
             tok = tok.strip()
@@ -240,20 +155,15 @@ def _load_hfsbr_for_online(cfg: PipelineConfig, fill: int) -> np.ndarray:
                 values.append(float(tok))
             except ValueError:
                 continue
-
         if not values:
             raise RuntimeError(f"HFSBR .txt file {path} did not contain any numeric tokens")
-
         arr = np.asarray(values, dtype=np.float64).ravel()
-
         if arr.shape[0] < BX_LEN:
             raise RuntimeError(
                 f"HFSBR from {path} has length {arr.shape[0]} < BX_LEN={BX_LEN}"
             )
-
         return arr
 
-    # 3) .h5 / .hd5
     if path.endswith(".h5") or path.endswith(".hd5"):
         with h5py.File(path, "r") as h5:
             if "hfsbr" in h5:
@@ -268,470 +178,652 @@ def _load_hfsbr_for_online(cfg: PipelineConfig, fill: int) -> np.ndarray:
         f"Please adapt _load_hfsbr_for_online."
     )
 
-@log_step("online_recovery")
-@timeit("online_recovery")
-def recover_bxraw_step(
-    data: dict,
+
+def _recover_online_chunk(
+    chunk: dict,
+    method: str,
+    *,
+    pedestal_data: dict | None = None,
+    afterglow_data: dict | None = None,
+    online_solver: OnlineRecoverySolver | None = None,
+) -> dict:
+    """
+    Undo the corrections already applied by the online HF processing.
+
+    Both supported methods return the same quantity in ``bxraw``:
+    the histogram before the online pedestal/afterglow corrections.
+
+    Auxiliary table alignment deliberately uses the original
+    ``align_aux_by_keys`` helper; no assumptions are made about row/chunk
+    ordering between HDF5 nodes.
+    """
+    bxraw_final = np.asarray(chunk["bxraw"], dtype=np.float32)
+
+    if method == "tables":
+        if pedestal_data is None or afterglow_data is None:
+            raise RuntimeError(
+                "online_recovery method='tables' requires pedestal and afterglow tables"
+            )
+
+        pedestal_4 = align_aux_by_keys(
+            main=chunk, aux=pedestal_data, colname="bxraw"
+        ).astype(np.float32)
+        afterglow_frac = align_aux_by_keys(
+            main=chunk, aux=afterglow_data, colname="bxraw"
+        ).astype(np.float32)
+
+        result = reconstruct_from_tables_batch(
+            bxraw_final=bxraw_final,
+            pedestal_4=pedestal_4,
+            afterglow_frac=afterglow_frac,
+        )
+
+    elif method == "online":
+        if online_solver is None:
+            raise RuntimeError(
+                "online_recovery method='online' requires OnlineRecoverySolver"
+            )
+        result = online_solver.recover_batch(bxraw_final)
+
+    else:
+        raise ValueError(
+            f"Unknown online_recovery.method={method!r}; expected 'tables' or 'online'"
+        )
+
+    out = dict(chunk)
+    out["bxraw"] = result.recovered_raw
+    return out
+
+# ---------------------------------------------------------------------------
+# Tiny generic row-series accumulator (O(T) memory, independent of BX_LEN)
+# ---------------------------------------------------------------------------
+class SeriesAccumulator:
+    """
+    Collects 1D per-row arrays across chunks and concatenates them once,
+    at the end. Used for every plotting quantity that turned out to be a
+    per-row scalar (mean SBIL, residual averages, laser BX values, ...)
+    rather than needing the full (T, BX_LEN) bxraw.
+    """
+
+    def __init__(self) -> None:
+        self._parts: List[np.ndarray] = []
+
+    def add(self, arr: np.ndarray) -> None:
+        self._parts.append(np.asarray(arr, dtype=np.float64))
+
+    def finalize(self) -> np.ndarray:
+        if not self._parts:
+            return np.array([], dtype=np.float64)
+        return np.concatenate(self._parts)
+
+
+# ---------------------------------------------------------------------------
+# Chunk-level pipeline steps
+# ---------------------------------------------------------------------------
+
+def restore_rates_chunk(
+    chunk: dict,
+    active_mask: np.ndarray,
+    solver: AfterglowSolver,
+    warm_state: dict,
+    n_jobs: int = -1,
+) -> dict:
+    """
+    Chunk-level equivalent of the LSQ-afterglow + dynamic-pedestal
+    restoration.
+
+    - use_warm_start=True: rows solved one at a time, in order, threading
+      `warm_state['prev_tail_params']` across chunk boundaries as well
+      as row boundaries -- reproduces AfterglowSolver.apply_batch's
+      sequential warm-start chain at O(chunk) memory.
+    - use_warm_start=False: rows are independent, solved in parallel via
+      joblib, chunk by chunk, exactly like apply_batch's non-warm-start
+      branch.
+
+    Does not recompute bx/avg/avgraw. Returns a new dict (shallow copy).
+    """
+    bxraw_obs = np.asarray(chunk["bxraw"], dtype=np.float64)
+    T = bxraw_obs.shape[0]
+    mu_corr = np.empty((T, BX_LEN), dtype=np.float32)
+
+    if solver.use_warm_start:
+        prev_tail_params = warm_state.get("prev_tail_params", None)
+
+        for i in range(T):
+            x0 = prev_tail_params if prev_tail_params is not None else None
+            mu_true, _ped = solver._solve_one(bxraw_obs[i], x0=x0)
+
+            dbg = solver.last_tail_debug
+            if dbg is not None and dbg.get("fit_ok", False):
+                prev_tail_params = np.asarray(dbg["fit_params"], dtype=np.float64)
+            else:
+                prev_tail_params = None
+
+            ped = calculate_dynamic_pedestal(mu_true)
+            corr = mu_true - ped[np.arange(BX_LEN) % 4]
+            mu_corr[i] = corr.astype(np.float32)
+
+        warm_state["prev_tail_params"] = prev_tail_params
+    else:
+        from joblib import Parallel, delayed
+
+        results = Parallel(n_jobs=n_jobs, prefer="threads", batch_size=8)(
+            delayed(solver._solve_one)(bxraw_obs[i], x0=None) for i in range(T)
+        )
+        for i, (mu_true, _ped) in enumerate(results):
+            ped = calculate_dynamic_pedestal(mu_true)
+            corr = mu_true - ped[np.arange(BX_LEN) % 4]
+            mu_corr[i] = corr.astype(np.float32)
+
+    out = dict(chunk)
+    out["bxraw"] = mu_corr
+    return out
+
+
+def apply_type1_chunk(
+    chunk: dict,
     cfg: PipelineConfig,
     active_mask: np.ndarray,
-    fill: int,
-    input_pattern: str,
+    p0: np.ndarray,
+    p1: np.ndarray,
+    p2: np.ndarray,
 ) -> dict:
-    bxraw_final = np.asarray(data["bxraw"], dtype=np.float32)
-    rec_cfg = cfg.online_recovery
-
-    use_tables = (rec_cfg.method == "tables")
-    use_online = (rec_cfg.method == "online")
-
-        
-    if use_online:
-        hfsbr = _load_hfsbr_for_online(cfg, fill)
-        linear = np.array(rec_cfg.linear_type1)
-        quad = np.array(rec_cfg.quad_type1)
-
-        states_online = reconstruct_from_online_batch(
-            bxraw_final=bxraw_final,
-            hfsbr=hfsbr,
-            linear=linear,
-            quad=quad,
-            pedestal=(data["pedestal"] if cfg.online_recovery.pedestal_node is not None else None),
-            active_mask=active_mask,
-            zero_bx=(3553, 3554, 3555, 3556, 3557),
-            show_progress=True,
-        )
-
-        data["bxraw"] = states_online
-    elif use_tables:
-        ped_node = rec_cfg.pedestal_node
-        aft_node = rec_cfg.afterglow_node
-
-        ped_data = load_hd5_to_arrays(
-            cfg.io.input_dir,
-            input_pattern,
-            node=ped_node,
-        )
-        aft_data = load_hd5_to_arrays(
-            cfg.io.input_dir,
-            input_pattern,
-            node=aft_node,
-        )
-
-        ped_4 = _align_aux_by_keys(
-            main=data,
-            aux=ped_data,
-            colname="bxraw",
-        ).astype(np.float32)
-
-        aft_frac = _align_aux_by_keys(
-            main=data,
-            aux=aft_data,
-            colname="bxraw",
-        ).astype(np.float32)
-
-
-        states_tables = reconstruct_from_tables_batch(
-            bxraw_final=bxraw_final,
-            pedestal_4=ped_4,
-            afterglow_frac=aft_frac,
-        )
-
-        data["bxraw"] = states_tables
-    else:
-        raise RuntimeError("online_recovery: states_online is None, check config")
-
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Step 1: afterglow / recovery of mu_true
-# ---------------------------------------------------------------------------
-
-def calculate_dynamic_pedestal(mu_hist: np.ndarray) -> np.ndarray:
     """
-    Exact copy of CMS dynamic pedestal logic.
-
-    We take the last 13*4 BXs (3500..3500+4*13-1 = 3500..3551),
-    group them by HF subdetector (0..3),
-    and return pedestal[4].
+    Chunk-level equivalent of apply_type1_step: combined (all-offsets-
+    at-once) Type-1 subtraction via `apply_type1_batch`, followed by
+    derived-column recompute. Returns a new dict.
     """
-    n_sample = 13
-    pedestal = np.zeros(4, dtype=np.float32)
-
-    
-    # last 52 BX (3500..3551)
-    base = 3500
-    for ibx in range(4):
-        s = 0.0
-        for j in range(ibx, 4 * n_sample, 4):
-            s += mu_hist[base + j]
-        pedestal[ibx] = s / n_sample
-    
-    return pedestal
-
-
-@log_step("restore_rates")
-@timeit("restore_rates")
-def restore_rates_step(data: dict, cfg: PipelineConfig, active_mask: np.ndarray) -> dict:
-    """
-    Step 1: restore true rates (mu_true) via LSQ,
-    then subtract the dynamic pedestal (CMS logic),
-    then recompute bx and avg.
-
-    Result:
-      - data["bxraw"] contains mu_true after dynamic pedestal subtraction
-      - data["bx"] / data["avg"] contain lumi after scaling by sigvis
-    """
-    fills = np.unique(data["fillnum"])
-    if fills.size != 1:
-        raise ValueError(f"Expected exactly one fill in file, got {fills}")
-    fill = int(fills[0])
-
-    # --- load HFSBR matrix ---
-    hfsbr_path = cfg.afterglow.hfsbr_pattern.format(fill=fill)
-    if not os.path.exists(hfsbr_path):
-        raise FileNotFoundError(f"HFSBR file not found: {hfsbr_path}")
-
-    bx_to_clean = cfg.afterglow.bx_to_clean or []
-    lambda_reg = cfg.afterglow.lambda_reg
-    lambda_nonactive = cfg.afterglow.lambda_nonactive
-    n_jobs = cfg.afterglow.n_jobs
-
-    # --- build LSQ solver ---
-    solver = build_afterglow_solver_from_file(
-        hfsbr_path=hfsbr_path,
-        active_mask=active_mask,
-        bx_to_clean=bx_to_clean,
-        p0_guess=None,
-        lambda_reg=lambda_reg,
-        lambda_nonactive=lambda_nonactive,
-    )
-
-    bxraw_obs = data["bxraw"]
-    assert bxraw_obs.shape[1] == BX_LEN
-
-    # --- main LSQ pass ---
-    mu_true, ped_lsq = solver.apply_batch(
-        bxraw_obs,
-        n_jobs=n_jobs,
-        desc=f"LSQ afterglow (fill {fill})",
-    )
-
-    # ------------------------------------------------------------------
-    # Dynamic pedestal subtraction (CMS logic)
-    # ------------------------------------------------------------------
-    mu_corr = np.empty_like(mu_true, dtype=np.float32)
-
-    for i in range(mu_true.shape[0]):
-        hist = mu_true[i]
-        ped = calculate_dynamic_pedestal(hist)
-
-        # subtract pedestal for BX 0..3551 using HF scheme (subdet = bx % 4)
-        corr = hist - ped[np.arange(BX_LEN) % 4]
-        mu_corr[i] = corr.astype(np.float32)
-
-    # --- update bxraw with mu_true after pedestal subtraction ---
-    data["bxraw"] = mu_corr
-
-    # ------------------------------------------------------------------
-    # Recompute bx and avg (these should be AFTER pedestal subtraction)
-    # ------------------------------------------------------------------
-    _recompute_derived_from_bxraw_inplace(data, cfg, active_mask)
-
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Step 2: fit Type-1
-# ---------------------------------------------------------------------------
-
-@log_step("compute_type1_step")
-@timeit("compute_type1_step")
-def compute_type1_step(data, cfg, active_mask: np.ndarray, fill: int):
-    """
-    Pipeline step: estimate Type-1 coefficients for a given fill.
-
-    - Uses bxraw (already restored from afterglow & pedestal).
-    - As "avg" (SBIL) it takes:
-        * data["sbil"] if present;
-        * else data["avg"] if present;
-        * else quickly computes sbil = sum(bxraw * mask) / Nactive.
-    - For each offset in cfg.type1.offsets:
-        * offset == 1 -> quadratic fit (order=2);
-        * offset >  1 -> linear fit (order=1).
-    - Saves p0, p1, p2, offsets, orders into an HDF5 file.
-    """
-    if "bxraw" not in data:
-        raise KeyError("compute_type1_step: 'bxraw' not found in data")
-
-    bxraw = np.asarray(data["bxraw"], dtype=np.float64)
-    if bxraw.ndim != 2 or bxraw.shape[1] != BX_LEN:
-        raise ValueError(
-            f"compute_type1_step: bxraw has shape {bxraw.shape}, expected (T, {BX_LEN})"
-        )
-
-    # --- SBIL / avg for Type-1 fit ---
-    if "sbil" in data:
-        avg = np.asarray(data["sbil"], dtype=np.float64)
-    elif "avg" in data:
-        avg = np.asarray(data["avg"], dtype=np.float64)
-    else:
-        # fallback: compute SBIL from bxraw and active mask
-        mask = np.asarray(active_mask, dtype=np.int32)
-        n_active = int(mask.sum())
-        if n_active == 0:
-            raise ValueError("compute_type1_step: active_mask has zero active BX")
-        avg = (bxraw * mask[None, :]).sum(axis=1) / float(n_active)
-
-    offsets = list(getattr(cfg.type1, "offsets", [1, 2, 3, 4]))
-    sbil_min = float(getattr(cfg.type1, "sbil_min", 0.1))
-
-    # --- compute Type-1 coefficients ---
-    p0, p1, p2, orders = compute_type1_coeffs(
-        bxraw=bxraw,
-        avg=avg,
-        active_mask=active_mask,
-        offsets=offsets,
-        sbil_min=sbil_min,
-    )
-
-    # --- where to save ---
-    type1_dir = _get_type1_dir(cfg)
-
-    path = save_type1_coeffs(
-        fill=fill,
-        output_dir=type1_dir,
-        p0=p0,
-        p1=p1,
-        p2=p2,
-        offsets=offsets,
-        orders=orders,
-    )
-
-    log.info(
-        "[compute_type1_step] fill %d: Type-1 coeffs saved to %s (offsets=%s)",
-        fill,
-        path,
-        offsets,
-    )
-
-    # --- optional debug / analysis block ---
-    # This is the "before Type-1 subtraction" diagnostic.
-    if getattr(cfg.type1, "debug", False):
-        analyze_type1_step(
-            data=data,
-            cfg=cfg,
-            active_mask=active_mask,
-            fill=fill,
-            tag="before"
-        )
-
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Step 3: apply Type-1
-# ---------------------------------------------------------------------------
-
-@log_step("apply_type1_step")
-@timeit("apply_type1_step")
-def apply_type1_step(data, cfg, active_mask: np.ndarray, fill: int):
-    """
-    Pipeline step: apply Type-1 subtraction to bxraw.
-
-    - Reads coefficients from type1_coeffs_fill{fill}.h5.
-    - Calls apply_type1_batch(bxraw, active_mask, p0, p1, p2).
-    - Updates:
-        * data["bxraw"] (mu_true after Type-1 subtraction),
-        * data["bx"] / data["avg"] (lumi after Type-1 subtraction).
-    - Optionally runs analyze_type1_step again if cfg.type1.debug_after_apply is True.
-    """
-    if "bxraw" not in data:
-        raise KeyError("apply_type1_step: 'bxraw' not found in data")
-
-    bxraw = np.asarray(data["bxraw"], dtype=np.float64)
-    if bxraw.ndim != 2 or bxraw.shape[1] != BX_LEN:
-        raise ValueError(
-            f"apply_type1_step: bxraw has shape {bxraw.shape}, expected (T, {BX_LEN})"
-        )
-
-    # --- where to find Type-1 coefficients ---
-    coeff_path = _get_type1_coeff_path(cfg, fill)
-    if not os.path.exists(coeff_path):
-        raise FileNotFoundError(
-            f"apply_type1_step: Type-1 coeff file not found: {coeff_path}"
-        )
-
-    # --- read coefficients ---
-    with h5py.File(coeff_path, "r") as h5:
-        p0 = h5["p0"][:]
-        p1 = h5["p1"][:]
-        p2 = h5["p2"][:]
-        # offsets and orders are kept for logging / sanity checks
-        offsets = h5["offsets"][:]
-        orders = h5["orders"][:]
-
-    log.info(
-        "[apply_type1_step] fill %d: loaded Type-1 coeffs from %s (offsets=%s, orders=%s)",
-        fill,
-        coeff_path,
-        list(offsets),
-        list(orders),
-    )
-
-    # --- apply Type-1 subtraction in mu-space ---
-    corrected_mu = apply_type1_batch(
-        bxraw=bxraw,
-        active_mask=active_mask,
-        p0=p0,
-        p1=p1,
-        p2=p2,
+    bxraw = np.asarray(chunk["bxraw"], dtype=np.float64)
+    corrected = apply_type1_batch(
+        bxraw=bxraw, active_mask=active_mask, p0=p0, p1=p1, p2=p2,
     ).astype(np.float32)
 
-    data["bxraw"] = corrected_mu
+    out = dict(chunk)
+    out["bxraw"] = corrected
+    _recompute_derived_from_bxraw_inplace(out, cfg, active_mask)
+    return out
 
-    # --- optional "after Type-1" diagnostics ---
-    if getattr(cfg.type1, "debug_after_apply", False):
-        analyze_type1_step(
-            data=data,
-            cfg=cfg,
-            active_mask=active_mask,
-            fill=fill,
-            tag="after"
+
+def apply_bunch_train_chunk(
+    chunk: dict,
+    cfg: PipelineConfig,
+    active_mask: np.ndarray,
+    coeffs: np.ndarray,
+) -> dict:
+    """
+    Chunk-level equivalent of apply_bunch_train_step: bunch-train
+    subtraction via `apply_bunch_train_batch`, followed by derived-column
+    recompute. Returns a new dict. Mirrors apply_type1_chunk; the only
+    real difference is that this must run against data that has already
+    had Type-1 (and the afterglow/pedestal correction) applied, so it is
+    called from a later pass than apply_type1_chunk (see
+    _pass_apply_bunch_train_and_write below).
+    """
+    bxraw = np.asarray(chunk["bxraw"], dtype=np.float64)
+    corrected = apply_bunch_train_batch(
+        bxraw=bxraw, active_mask=active_mask, coeffs=coeffs,
+    ).astype(np.float32)
+
+    out = dict(chunk)
+    out["bxraw"] = corrected
+    _recompute_derived_from_bxraw_inplace(out, cfg, active_mask)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Pass 0: input -> (optional fixed pedestal + LSQ afterglow + dynamic
+# pedestal + derived recompute) -> scratch_stage0, feeding all the exact
+# streaming plot/diagnostic accumulators along the way.
+# ---------------------------------------------------------------------------
+def _pass0_prepare(
+    fill: int,
+    cfg: PipelineConfig,
+    active_mask: np.ndarray,
+    input_name: str,
+    node: str,
+    chunk_size: int,
+    scratch_stage0: str,
+    scale: float,
+    active_bool: np.ndarray,
+    type1_mask: np.ndarray,
+    type2_mask: np.ndarray,
+    raw_profile_acc: Optional[BxProfileAccumulator],
+    t2_profile_acc: Optional[BxProfileAccumulator],
+    t2_residual_accs: Optional[tuple],
+    raw_lumi_sum_acc: Optional[SeriesAccumulator],
+    raw_laser_accs: Optional[dict],
+) -> int:
+    solver: Optional[AfterglowSolver] = None
+    ped4 = None
+    warm_state: dict = {}
+
+    # Online-recovery objects/tables are prepared once per fill.
+    online_method: Optional[str] = None
+    online_solver: Optional[OnlineRecoverySolver] = None
+    online_ped_data = None
+    online_aft_data = None
+
+    if cfg.steps.online_recovery:
+        online_method = str(cfg.online_recovery.method).lower()
+
+        if online_method == "tables":
+            online_ped_data = load_hd5_to_arrays(
+                cfg.io.input_dir,
+                input_name,
+                node=cfg.online_recovery.pedestal_node,
+            )
+            online_aft_data = load_hd5_to_arrays(
+                cfg.io.input_dir,
+                input_name,
+                node=cfg.online_recovery.afterglow_node,
+            )
+
+        elif online_method == "online":
+            hfsbr_online = _load_hfsbr_for_online(cfg, fill)
+            online_solver = OnlineRecoverySolver(
+                hfsbr=hfsbr_online,
+                active_mask=active_mask,
+                linear=np.array(cfg.online_recovery.linear_type1),
+                quad=np.array(cfg.online_recovery.quad_type1),
+            )
+
+        else:
+            raise ValueError(
+                f"Unknown online_recovery.method={cfg.online_recovery.method!r}; "
+                "expected 'tables' or 'online'"
+            )
+
+        log.info(
+            "[online_recovery] fill %d: method=%s",
+            fill,
+            online_method,
         )
 
-    _recompute_derived_from_bxraw_inplace(data, cfg, active_mask)
+    if cfg.steps.restore_rates:
+        hfsbr_path = cfg.afterglow.hfsbr_pattern.format(fill=fill)
+        if not os.path.exists(hfsbr_path):
+            raise FileNotFoundError(f"HFSBR file not found: {hfsbr_path}")
 
-    return data
+        solver = build_afterglow_solver_from_file(
+            hfsbr_path=hfsbr_path,
+            active_mask=active_mask,
+            bx_to_clean=cfg.afterglow.bx_to_clean or [],
+            p0_guess=None,
+            lambda_reg=cfg.afterglow.lambda_reg,
+            lambda_nonactive=cfg.afterglow.lambda_nonactive,
+        )
+        ped4 = getattr(cfg.afterglow, "fixed_pedestal_4", None)
+
+    bt_ref_data = None
+    if cfg.steps.bunch_train:
+        bt_ref_data = load_hd5_to_arrays(
+            cfg.bunch_train.linear_reference,
+            cfg.bunch_train.input_pattern.format(fill=fill),
+            node=cfg.bunch_train.node,
+        )
+
+    n_rows_total = 0
+
+    with Hd5ChunkWriter(scratch_stage0, node=node) as writer:
+        for chunk in iter_hd5_row_chunks(
+            cfg.io.input_dir, input_name, node=node,
+            chunk_size=chunk_size, fill_filter=fill,
+        ):
+            raw_bxraw = np.asarray(chunk["bxraw"], dtype=np.float64)
+
+            if raw_profile_acc is not None:
+                raw_profile_acc.add_chunk(raw_bxraw)
+            if raw_lumi_sum_acc is not None:
+                raw_lumi_sum_acc.add(compute_scaled_active_sum_chunk(raw_bxraw, active_bool, scale))
+            if raw_laser_accs is not None:
+                laser_vals = compute_laser_columns_chunk(raw_bxraw, scale)
+                for bcid, vals in laser_vals.items():
+                    raw_laser_accs[bcid].add(vals)
+
+            if cfg.steps.online_recovery:
+                chunk = _recover_online_chunk(
+                    chunk,
+                    online_method,
+                    pedestal_data=online_ped_data,
+                    afterglow_data=online_aft_data,
+                    online_solver=online_solver,
+                )
+
+            if cfg.steps.restore_rates:
+                if ped4 is not None:
+                    subtract_fixed_pedestal_mod4_inplace(chunk, ped4)
+
+                chunk = restore_rates_chunk(
+                    chunk, active_mask, solver, warm_state,
+                    n_jobs=cfg.afterglow.n_jobs,
+                )
+                _recompute_derived_from_bxraw_inplace(chunk, cfg, active_mask)
+
+            if cfg.steps.bunch_train:
+                bxraw_ref = align_aux_by_keys(
+                    main=chunk, aux=bt_ref_data, colname="bxraw"
+                ).astype(np.float32)
+                chunk = dict(chunk)
+                chunk["bxraw_ref"] = bxraw_ref
+
+            t2_bxraw = np.asarray(chunk["bxraw"], dtype=np.float64)
+            if t2_profile_acc is not None:
+                t2_profile_acc.add_chunk(t2_bxraw)
+            if t2_residual_accs is not None:
+                avg_col_acc, avg_type1_acc, avg_type2_acc = t2_residual_accs
+                avg_col, avg_type1, avg_type2 = compute_residual_row_averages(
+                    t2_bxraw, active_bool, type1_mask, type2_mask, scale,
+                )
+                avg_col_acc.add(avg_col)
+                avg_type1_acc.add(avg_type1)
+                avg_type2_acc.add(avg_type2)
+
+            writer.write_chunk(chunk)
+            n_rows_total += next(iter(chunk.values())).shape[0]
+
+    return n_rows_total
+
 
 # ---------------------------------------------------------------------------
-# Step 4: bunch train corrections
+# Type-1 coefficient fit: sequential per-offset, via ping-pong scratch
+# files, reproducing compute_type1_coeffs' exact semantics without ever
+# holding the whole fill's bxraw in memory.
 # ---------------------------------------------------------------------------
-
-@log_step("compute_bunch_train_step")
-@timeit("compute_bunch_train_step")
-def compute_bunch_train_step(data, cfg, active_mask: np.ndarray, fill: int):
+def compute_type1_fill(
+    fill: int,
+    cfg: PipelineConfig,
+    active_mask: np.ndarray,
+    node: str,
+    chunk_size: int,
+    scratch_dir: str,
+    scratch_stage0: str,
+) -> str:
     """
-    Pipeline step: estimate bunch train coefficients for a given fill.
+    Fits Type-1 coefficients for the whole fill by streaming over
+    `scratch_stage0` in multiple passes -- one pair of passes per
+    offset, largest offset first, exactly matching the sequential
+    "fit, then subtract estimated contribution before fitting the next
+    (smaller) offset" semantics of the in-memory `compute_type1_coeffs`.
+
+    The scratch files created here (`fit_a.h5` / `fit_b.h5`) only ever
+    hold *fit-time* mutated bxraw, used purely to accumulate fit
+    statistics -- they are discarded at the end and never affect
+    `scratch_stage0`.
+
+    Returns the path to the saved coefficient file.
     """
-    if "bxraw" not in data:
-        raise KeyError("compute_bunch_train_step: 'bxraw' not found in data")
-    if "bxraw_ref" not in data:
-        raise KeyError("compute_bunch_train_step: 'bxraw_ref' not found in data")
+    offsets: List[int] = list(getattr(cfg.type1, "offsets", [1, 2, 3, 4]))
+    sbil_min = float(getattr(cfg.type1, "sbil_min", 0.1))
+    max_offset = max(offsets) if offsets else 0
 
-    bxraw = np.asarray(data["bxraw"], dtype=np.float64)
-    bxraw_ref = np.asarray(data["bxraw_ref"], dtype=np.float64)
+    p0 = np.zeros(max_offset + 1, dtype=np.float64)
+    p1 = np.zeros(max_offset + 1, dtype=np.float64)
+    p2 = np.zeros(max_offset + 1, dtype=np.float64)
+    orders = np.zeros(max_offset + 1, dtype=np.int32)
 
-    # --- SBIL / avg for Type-1 fit ---
-    if "sbil" in data:
-        avg = np.asarray(data["sbil"], dtype=np.float64)
-    elif "avg" in data:
-        avg = np.asarray(data["avg"], dtype=np.float64)
-    else:
-        # fallback: compute SBIL from bxraw and active mask
-        mask = np.asarray(active_mask, dtype=np.int32)
-        n_active = int(mask.sum())
-        if n_active == 0:
-            raise ValueError("compute_bunch_train_step: active_mask has zero active BX")
-        avg = (bxraw * mask[None, :]).sum(axis=1) / float(n_active)
+    fit_scratch_a = os.path.join(scratch_dir, "fit_a.h5")
+    fit_scratch_b = os.path.join(scratch_dir, "fit_b.h5")
 
+    cur_path = scratch_stage0
+    toggle_paths = [fit_scratch_a, fit_scratch_b]
+    toggle_idx = 0
+
+    for off in reversed(offsets):
+        if off <= 0:
+            continue
+        order = 2 if off == 1 else 1
+
+        acc = Type1OffsetAccumulator()
+        for chunk in iter_hd5_row_chunks(
+            os.path.dirname(cur_path), os.path.basename(cur_path),
+            node=node, chunk_size=chunk_size,
+        ):
+            bxraw_chunk = np.asarray(chunk["bxraw"], dtype=np.float64)
+            avg_chunk = get_sbil_like_column(chunk, active_mask)
+            accumulate_type1_offset_chunk(acc, bxraw_chunk, avg_chunk, active_mask, off, sbil_min)
+
+        c0, c1, c2 = acc.finalize(order)
+        p0[off], p1[off], p2[off], orders[off] = c0, c1, c2, order
+
+        next_path = toggle_paths[toggle_idx % 2]
+        toggle_idx += 1
+
+        with Hd5ChunkWriter(next_path, node=node) as writer:
+            for chunk in iter_hd5_row_chunks(
+                os.path.dirname(cur_path), os.path.basename(cur_path),
+                node=node, chunk_size=chunk_size,
+            ):
+                bxraw_chunk = np.asarray(chunk["bxraw"], dtype=np.float64).copy()
+                subtract_type1_offset_inplace(bxraw_chunk, active_mask, off, c0, c1, c2)
+                chunk = dict(chunk)
+                chunk["bxraw"] = bxraw_chunk.astype(np.float32)
+                writer.write_chunk(chunk)
+
+        cur_path = next_path
+
+    type1_dir = _get_type1_dir(cfg)
+    coeff_path = save_type1_coeffs(
+        fill=fill, output_dir=type1_dir,
+        p0=p0, p1=p1, p2=p2, offsets=offsets, orders=orders,
+    )
+    log.info(
+        "[compute_type1_fill] fill %d: Type-1 coeffs saved to %s (offsets=%s)",
+        fill, coeff_path, offsets,
+    )
+
+    for p in (fit_scratch_a, fit_scratch_b):
+        if os.path.exists(p):
+            os.remove(p)
+
+    return coeff_path
+
+
+# ---------------------------------------------------------------------------
+# Bunch-train coefficient fit: single accumulate-then-fit pass over the
+# Type-1-and-afterglow-corrected scratch file. Unlike Type-1, bunch-train
+# has one fixed order (no sequential chain of offsets to fit and subtract
+# in turn), so a single pass suffices -- this is the bunch-train analogue
+# of compute_type1_fill.
+# ---------------------------------------------------------------------------
+def compute_bunch_train_fill(
+    fill: int,
+    cfg: PipelineConfig,
+    active_mask: np.ndarray,
+    node: str,
+    chunk_size: int,
+    scratch_stage1: str,
+) -> str:
+    """
+    Fits bunch-train coefficients for the whole fill by streaming over
+    `scratch_stage1` -- the data after afterglow/pedestal restoration and
+    Type-1 subtraction, with "bxraw_ref" already merged in per row during
+    _pass0_prepare -- accumulating fit statistics chunk by chunk and
+    fitting once at the end, the same accumulate-then-fit shape as
+    compute_type1_fill's per-offset passes.
+
+    Returns the path to the saved coefficient file.
+    """
     order = int(getattr(cfg.bunch_train, "order", 1))
     sbil_min = float(getattr(cfg.bunch_train, "sbil_min", 0.1))
 
-    # --- compute Type-1 coefficients ---
-    p = compute_bunch_train_coeffs(
-        bxraw=bxraw,
-        bxraw_ref=bxraw_ref,
-        avg=avg,
-        active_mask=active_mask,
-        order=order,
-        sbil_min=sbil_min,
-    )
-
-    # --- where to save ---
-    type1_dir = _get_type1_dir(cfg)
-
-    path = save_bunch_train_coeffs(
-        fill=fill,
-        output_dir=type1_dir,
-        coeffs=p,
-    )
-
-    log.info(
-        "[compute_bunch_train_step] fill %d: Type-1 coeffs saved to %s",
-        fill,
-        path,
-    )
-
-    # --- optional debug / analysis block ---
-    # This is the "before Type-1 subtraction" diagnostic.
-    if getattr(cfg.bunch_train, "make_plots", False):
-        analyze_bunch_train_step(
-            data=data,
-            cfg=cfg,
-            active_mask=active_mask,
-            fill=fill,
-            tag="before"
+    acc = BunchTrainAccumulator()
+    for chunk in iter_hd5_row_chunks(
+        os.path.dirname(scratch_stage1), os.path.basename(scratch_stage1),
+        node=node, chunk_size=chunk_size,
+    ):
+        bxraw_chunk = np.asarray(chunk["bxraw"], dtype=np.float64)
+        bxraw_ref_chunk = np.asarray(chunk["bxraw_ref"], dtype=np.float64)
+        avg_chunk = get_sbil_like_column(chunk, active_mask)
+        accumulate_bunch_train_chunk(
+            acc, bxraw_chunk, bxraw_ref_chunk, avg_chunk, active_mask, sbil_min,
         )
 
-    return data
+    coeffs = acc.finalize(order)
 
-@log_step("apply_bunch_train_step")
-@timeit("apply_bunch_train_step")
-def apply_bunch_train_step(data, cfg, active_mask: np.ndarray, fill: int):
+    type1_dir = _get_type1_dir(cfg)
+    coeff_path = save_bunch_train_coeffs(
+        fill=fill, output_dir=type1_dir, coeffs=coeffs,
+    )
+    log.info(
+        "[compute_bunch_train_fill] fill %d: Bunch Train coeffs saved to %s",
+        fill, coeff_path,
+    )
+
+    return coeff_path
+
+
+# ---------------------------------------------------------------------------
+# Final pass: apply Type-1 (if enabled) on scratch_stage0, recompute
+# derived, feed final-stage accumulators, write final output.
+# ---------------------------------------------------------------------------
+def _feed_final_accumulators(
+    bxraw: np.ndarray,
+    scale: float,
+    active_bool: np.ndarray,
+    type1_mask: np.ndarray,
+    type2_mask: np.ndarray,
+    profile_acc: Optional[BxProfileAccumulator],
+    residual_accs: Optional[tuple],
+    lumi_sum_acc: Optional[SeriesAccumulator],
+    laser_accs: Optional[dict],
+) -> None:
     """
-    Pipeline step: apply bunch train subtraction to bxraw.
+    Shared by both passes that can produce the "final" stage's data
+    (_pass_apply_type1_and_write when bunch-train is off,
+    _pass_apply_bunch_train_and_write when it's on), so the two passes
+    feed the plotting/diagnostic accumulators identically.
     """
-    if "bxraw" not in data:
-        raise KeyError("apply_bunch_train_step: 'bxraw' not found in data")
+    if profile_acc is not None:
+        profile_acc.add_chunk(bxraw)
+    if residual_accs is not None:
+        avg_col_acc, avg_type1_acc, avg_type2_acc = residual_accs
+        avg_col, avg_type1, avg_type2 = compute_residual_row_averages(
+            bxraw, active_bool, type1_mask, type2_mask, scale,
+        )
+        avg_col_acc.add(avg_col)
+        avg_type1_acc.add(avg_type1)
+        avg_type2_acc.add(avg_type2)
+    if lumi_sum_acc is not None:
+        lumi_sum_acc.add(compute_scaled_active_sum_chunk(bxraw, active_bool, scale))
+    if laser_accs is not None:
+        laser_vals = compute_laser_columns_chunk(bxraw, scale)
+        for bcid, vals in laser_vals.items():
+            laser_accs[bcid].add(vals)
 
-    bxraw = np.asarray(data["bxraw"], dtype=np.float64)
 
-    # --- where to find bunch train coefficients ---
+def _pass_apply_type1_and_write(
+    fill: int,
+    cfg: PipelineConfig,
+    active_mask: np.ndarray,
+    node: str,
+    chunk_size: int,
+    scratch_stage0: str,
+    output_path: str,
+    scale: float,
+    active_bool: np.ndarray,
+    type1_mask: np.ndarray,
+    type2_mask: np.ndarray,
+    feed_final_accumulators: bool,
+    final_profile_acc: Optional[BxProfileAccumulator],
+    final_residual_accs: Optional[tuple],
+    final_lumi_sum_acc: Optional[SeriesAccumulator],
+    final_laser_accs: Optional[dict],
+) -> None:
+    """
+    Streams scratch_stage0 -> output_path, applying Type-1 (if enabled)
+    and recomputing derived columns.
+
+    `output_path` is the true final output file when bunch-train is off
+    (the original behaviour); when cfg.steps.bunch_train is on, the
+    caller instead passes an intermediate scratch path, since bunch-train
+    still needs to be applied afterwards -- in that case
+    `feed_final_accumulators` must be False, because the "final"
+    diagnostics belong after bunch-train, not after Type-1
+    (see _pass_apply_bunch_train_and_write below).
+    """
+    p0 = p1 = p2 = None
+    if cfg.steps.apply_type1:
+        coeff_path = _get_type1_coeff_path(cfg, fill)
+        if not os.path.exists(coeff_path):
+            raise FileNotFoundError(f"apply_type1: Type-1 coeff file not found: {coeff_path}")
+        with h5py.File(coeff_path, "r") as h5:
+            p0 = h5["p0"][:]
+            p1 = h5["p1"][:]
+            p2 = h5["p2"][:]
+
+    with Hd5ChunkWriter(output_path, node=node) as writer:
+        for chunk in iter_hd5_row_chunks(
+            os.path.dirname(scratch_stage0), os.path.basename(scratch_stage0),
+            node=node, chunk_size=chunk_size,
+        ):
+            if cfg.steps.apply_type1:
+                chunk = apply_type1_chunk(chunk, cfg, active_mask, p0, p1, p2)
+            else:
+                # "Recompute rates for safety" -- run_fill always did this
+                # unconditionally after the enabled-steps block, regardless
+                # of which steps actually ran. Preserve that here.
+                chunk = dict(chunk)
+                _recompute_derived_from_bxraw_inplace(chunk, cfg, active_mask)
+
+            if feed_final_accumulators:
+                final_bxraw = np.asarray(chunk["bxraw"], dtype=np.float64)
+                _feed_final_accumulators(
+                    final_bxraw, scale, active_bool, type1_mask, type2_mask,
+                    final_profile_acc, final_residual_accs,
+                    final_lumi_sum_acc, final_laser_accs,
+                )
+
+            writer.write_chunk(chunk)
+
+
+# ---------------------------------------------------------------------------
+# Bunch-train pass: apply bunch-train correction on top of the Type-1 (and
+# afterglow) corrected scratch file, recompute derived, feed final-stage
+# accumulators, write the true final output. Only used when
+# cfg.steps.bunch_train is enabled; the direct analogue of
+# _pass_apply_type1_and_write, one stage later.
+# ---------------------------------------------------------------------------
+def _pass_apply_bunch_train_and_write(
+    fill: int,
+    cfg: PipelineConfig,
+    active_mask: np.ndarray,
+    node: str,
+    chunk_size: int,
+    scratch_stage1: str,
+    output_path: str,
+    scale: float,
+    active_bool: np.ndarray,
+    type1_mask: np.ndarray,
+    type2_mask: np.ndarray,
+    final_profile_acc: Optional[BxProfileAccumulator],
+    final_residual_accs: Optional[tuple],
+    final_lumi_sum_acc: Optional[SeriesAccumulator],
+    final_laser_accs: Optional[dict],
+) -> None:
     type1_dir = _get_type1_dir(cfg)
     coeff_path = os.path.join(type1_dir, f"bunch_train_coeffs_fill{fill}.h5")
     if not os.path.exists(coeff_path):
         raise FileNotFoundError(
-            f"apply_bunch_train_step: Bunch Train coeff file not found: {coeff_path}"
+            f"apply_bunch_train: Bunch Train coeff file not found: {coeff_path}"
         )
-
-    # --- read coefficients ---
     with h5py.File(coeff_path, "r") as h5:
-        p = h5["coeffs"][:]
+        coeffs = h5["coeffs"][:]
 
-    log.info(
-        "[apply_bunch_train_step] fill %d: loaded Bunch Train coeffs from %s",
-        fill,
-        coeff_path,
-    )
+    with Hd5ChunkWriter(output_path, node=node) as writer:
+        for chunk in iter_hd5_row_chunks(
+            os.path.dirname(scratch_stage1), os.path.basename(scratch_stage1),
+            node=node, chunk_size=chunk_size,
+        ):
+            chunk = apply_bunch_train_chunk(chunk, cfg, active_mask, coeffs)
 
-    # --- apply bunch_train subtraction in mu-space ---
-    corrected_mu = apply_bunch_train_batch(
-        bxraw=bxraw,
-        active_mask=active_mask,
-        coeffs=p,
-    ).astype(np.float32)
+            final_bxraw = np.asarray(chunk["bxraw"], dtype=np.float64)
+            _feed_final_accumulators(
+                final_bxraw, scale, active_bool, type1_mask, type2_mask,
+                final_profile_acc, final_residual_accs,
+                final_lumi_sum_acc, final_laser_accs,
+            )
 
-    data["bxraw"] = corrected_mu
-
-    # --- recompute bx and avg AFTER bunch train subtraction ---
-    sigvis = getattr(cfg.afterglow, "sigvis", None)
-    scale = 1.0 if not sigvis else 11245.6 / float(sigvis)
-
-    bx_lumi = (corrected_mu * scale).astype(np.float32, copy=False)
-    data["bx"] = bx_lumi
-    data["avg"] = bx_lumi.mean(axis=1).astype(np.float32)
-
-    # --- optional "after bunch train" diagnostics ---
-    if getattr(cfg.bunch_train, "make_plots", False):
-        analyze_bunch_train_step(
-            data=data,
-            cfg=cfg,
-            active_mask=active_mask,
-            fill=fill,
-            tag="after"
-        )
-
-    return data
+            writer.write_chunk(chunk)
 
 
 # ---------------------------------------------------------------------------
@@ -740,228 +832,266 @@ def apply_bunch_train_step(data, cfg, active_mask: np.ndarray, fill: int):
 
 @log_step("run_fill")
 @timeit("run_fill")
-def run_fill(fill: int, cfg: PipelineConfig) -> None:
+def run_fill(
+    fill: int,
+    cfg: PipelineConfig,
+    chunk_size: Optional[int] = None,
+    keep_scratch_on_error: bool = False,
+) -> None:
     """
-    Full pipeline for a single fill:
+    Full pipeline for a single fill, processed in bounded-memory chunks:
 
-      - load input HDF5 (possibly multiple files and multiple fills),
-      - filter rows with fillnum == fill,
+      - stream input HDF5 (rows filtered by fillnum == fill as read),
       - load active BX mask,
-      - sequentially apply enabled steps,
-      - save the result to a new HDF5 file.
+      - pass 0: optional fixed-mod4-pedestal + LSQ afterglow + dynamic
+        pedestal + derived recompute, streamed to a scratch file,
+      - Type-1 fit (if enabled): sequential per-offset fit via ping-pong
+        scratch passes, exactly matching the original offset-by-offset
+        semantics,
+      - final pass: Type-1 apply (if enabled) + derived recompute,
+        streamed to the output file.
+
+    Plotting and diagnostics (plot_hist_bx, plot_residuals,
+    analyze_type1_step, and optionally plot_lumi_comparison /
+    plot_lasers) are all fed from EXACT streaming accumulators computed
+    along the way (per-BX mean profile, per-row SBIL/residual/laser
+    series) -- these are the only quantities those plots ever actually
+    needed, so nothing here is a sampled approximation; memory cost for
+    all of them is O(T) or O(BX_LEN), never O(T * BX_LEN).
+
+    Config flags (all default to the previous behaviour):
+      - cfg.type1.make_plots           -> plot_hist_bx + plot_residuals
+      - cfg.type1.debug                -> analyze_type1_step, tag="before"
+      - cfg.type1.debug_after_apply    -> analyze_type1_step, tag="after"
+      - cfg.type1.make_lumi_comparison_plot -> plot_lumi_comparison (off by
+        default, same as it was commented out in the original pipeline)
+      - cfg.type1.make_laser_plots     -> plot_lasers (off by default,
+        same reason)
+
+    `chunk_size` defaults to `cfg.io.chunk_size` if set, else
+    `DEFAULT_CHUNK_SIZE`.
     """
+    if chunk_size is None:
+        chunk_size = getattr(cfg.io, "chunk_size", DEFAULT_CHUNK_SIZE)
+
     input_name = cfg.io.input_pattern.format(fill=fill)
     output_name = cfg.io.output_pattern.format(fill=fill)
+    node = cfg.io.node
 
-    # --- active BX mask from npy file ---
+    # --- active BX mask from JSON file ---
     if not cfg.io.active_mask_pattern:
         raise ValueError("io.active_mask_pattern is not set in config")
 
     mask_path = cfg.io.active_mask_pattern.format(fill=fill)
     if not os.path.exists(mask_path):
-        raise FileNotFoundError(f"ActiveBX mask not found: {mask_path}")
+        raise FileNotFoundError(f"Active BX mask not found: {mask_path}")
 
-    active_mask = np.load(mask_path)
+    active_mask = load_active_mask(mask_path, expected_len=BX_LEN)
     active_mask = np.asarray(active_mask, dtype=np.int32)
+
+    if active_mask.ndim != 1:
+        raise ValueError(
+            f"Active BX mask must be a one-dimensional JSON list, got shape {active_mask.shape}"
+        )
     if active_mask.shape[0] != BX_LEN:
         raise ValueError(f"active_mask len={active_mask.shape[0]} != BX_LEN={BX_LEN}")
+    if not np.all((active_mask == 0) | (active_mask == 1)):
+        bad_values = np.unique(active_mask[(active_mask != 0) & (active_mask != 1)])
+        raise ValueError(f"Active BX mask must contain only 0 and 1, found: {bad_values.tolist()}")
 
-    # --- 1) load input data (may contain multiple files and multiple fills) ---
-    data = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.io.node)
-    
-    # sort by runnum, lsnum, nbnum before extracting hists
-    data = sort_dict_of_arrays(data)
+    # --- flags ---
+    make_plots = bool(getattr(cfg.type1, "make_plots", False))
+    debug_before = bool(getattr(cfg.type1, "debug", False))
+    debug_after = bool(getattr(cfg.type1, "debug_after_apply", False))
+    make_lumi_comparison_plot = bool(getattr(cfg.type1, "make_lumi_comparison_plot", False))
+    make_laser_plots = bool(getattr(cfg.type1, "make_laser_plots", False))
 
-    # columns used for merging two tables together
-    merge_cols = ['fillnum', 'runnum', 'lsnum', 'nbnum']
+    need_t2_residuals = make_plots or debug_before
+    need_final_residuals = make_plots or debug_after
+    need_lumi_extras = make_lumi_comparison_plot or make_laser_plots
 
-    # add the pedestal data (if needed)
-    if cfg.online_recovery.pedestal_node is not None and cfg.steps.revert_online:
-        ped = load_hd5_to_arrays(cfg.io.input_dir, input_name, node=cfg.online_recovery.pedestal_node)
+    scale = 11245.6 / float(cfg.afterglow.sigvis)
+    active_bool, type1_mask, type2_mask = build_residual_masks(active_mask, cfg.afterglow.bx_to_clean)
 
-        if data["timestampsec"].size != ped["timestampsec"].size:
+    # --- accumulators (created lazily, only if actually needed) ---
+    raw_profile_acc = BxProfileAccumulator() if make_plots else None
+    t2_profile_acc = BxProfileAccumulator() if make_plots else None
+    final_profile_acc = BxProfileAccumulator() if make_plots else None
+
+    t2_residual_accs = (SeriesAccumulator(), SeriesAccumulator(), SeriesAccumulator()) if need_t2_residuals else None
+    final_residual_accs = (SeriesAccumulator(), SeriesAccumulator(), SeriesAccumulator()) if need_final_residuals else None
+
+    raw_lumi_sum_acc = SeriesAccumulator() if need_lumi_extras else None
+    final_lumi_sum_acc = SeriesAccumulator() if need_lumi_extras else None
+
+    raw_laser_accs = {bcid: SeriesAccumulator() for bcid in LASER_BCID} if make_laser_plots else None
+    final_laser_accs = {bcid: SeriesAccumulator() for bcid in LASER_BCID} if make_laser_plots else None
+
+    scratch_dir = os.path.join(cfg.io.output_dir, ".scratch", str(fill))
+    os.makedirs(scratch_dir, exist_ok=True)
+    scratch_stage0 = os.path.join(scratch_dir, "stage0.h5")
+
+    try:
+        n_rows = _pass0_prepare(
+            fill=fill, cfg=cfg, active_mask=active_mask,
+            input_name=input_name, node=node, chunk_size=chunk_size,
+            scratch_stage0=scratch_stage0,
+            scale=scale, active_bool=active_bool, type1_mask=type1_mask, type2_mask=type2_mask,
+            raw_profile_acc=raw_profile_acc,
+            t2_profile_acc=t2_profile_acc,
+            t2_residual_accs=t2_residual_accs,
+            raw_lumi_sum_acc=raw_lumi_sum_acc,
+            raw_laser_accs=raw_laser_accs,
+        )
+
+        if n_rows == 0:
             log.warning(
-                "[run_fill] fill %d: pedestal data not present for %d entries. Dropping rows...",
-                fill,
-                data["timestampsec"].size - ped["timestampsec"].size,
-            )
-
-        if not _is_unique_columns([ped[c] for c in merge_cols]):
-            raise ValueError(f"{merge_cols} values are not unique. Choose another column to merge on.")
-
-        data = _inner_merge_one_column(data, ped, merge_cols, "bxraw", "pedestal")
-    
-    # add the reference data for the bunch train correction (if needed)
-    if cfg.steps.bunch_train:
-        ref = load_hd5_to_arrays(cfg.bunch_train.linear_reference, cfg.bunch_train.input_pattern.format(fill=fill), node=cfg.bunch_train.node)
-        before = data["timestampsec"].size
-
-        if not _is_unique_columns([ref[c] for c in merge_cols]):
-            raise ValueError(f"{merge_cols} values are not unique. Choose another column to merge on.")
-
-        data = _inner_merge_one_column(data, ref, merge_cols, "bxraw", "bxraw_ref")
-        
-        if data["timestampsec"].size != before:
-            log.warning(
-                "[run_fill] fill %d: reference luminometer data not present for %d entries. Dropping rows...",
-                fill,
-                before - data["timestampsec"].size,
-            )
-    
-
-    # --- 1a) keep only rows corresponding to the current fill ---
-    fill_arr = data.get("fillnum", None)
-    if fill_arr is not None:
-        fill_arr = np.asarray(fill_arr)
-        unique_fills = np.unique(fill_arr)
-
-        if fill not in unique_fills:
-            log.warning(
-                "[run_fill] fill %d: no rows with fillnum=%d in input (found fills: %s), skipping",
-                fill,
-                fill,
-                unique_fills,
+                "[run_fill] fill %d: no rows with fillnum=%d in input, skipping", fill, fill,
             )
             return
 
-        mask = (fill_arr == fill)
-        n_before = fill_arr.size
-        n_after = int(mask.sum())
+        if make_plots:
+            plot_hist_bx_from_profile(raw_profile_acc.mean_profile(), cfg, fill, 'Uncorr. Luminosity')
+            plot_hist_bx_from_profile(t2_profile_acc.mean_profile(), cfg, fill, 'T2 Corr. Luminosity')
 
-        if n_after == 0:
-            log.warning(
-                "[run_fill] fill %d: selection on fillnum left zero rows (fills in file: %s), skipping",
-                fill,
-                unique_fills,
+        if need_t2_residuals:
+            avg_col, avg_type1, avg_type2 = (a.finalize() for a in t2_residual_accs)
+            if make_plots:
+                plot_residuals_finalize(
+                    avg_col, avg_type1, avg_type2, cfg, fill, 't2_corr',
+                    n_col=int(active_bool.sum()), n_type1=int(type1_mask.sum()), n_type2=int(type2_mask.sum()),
+                )
+            if debug_before:
+                analyze_type1_fill_chunked(
+                    lambda: iter_hd5_row_chunks(
+                        os.path.dirname(scratch_stage0), os.path.basename(scratch_stage0),
+                        node=node, chunk_size=chunk_size,
+                    ),
+                    cfg, active_mask, fill, tag="before",
+                )
+
+        if cfg.steps.compute_type1:
+            compute_type1_fill(
+                fill=fill, cfg=cfg, active_mask=active_mask,
+                node=node, chunk_size=chunk_size,
+                scratch_dir=scratch_dir, scratch_stage0=scratch_stage0,
             )
-            return
 
-        if unique_fills.size > 1:
-            log.info(
-                "[run_fill] fill %d: filtering by fillnum -> kept %d of %d rows (fills in file: %s)",
-                fill,
-                n_after,
-                n_before,
-                unique_fills,
+        output_full_path = os.path.join(cfg.io.output_dir, output_name)
+
+        if cfg.steps.bunch_train:
+            # Type-1 apply now targets an intermediate scratch file rather
+            # than the final output, since bunch-train still needs to run
+            # on top of it; the "final" accumulators are fed later, after
+            # bunch-train, so they aren't fed here.
+            scratch_stage1 = os.path.join(scratch_dir, "stage1.h5")
+            _pass_apply_type1_and_write(
+                fill=fill, cfg=cfg, active_mask=active_mask,
+                node=node, chunk_size=chunk_size,
+                scratch_stage0=scratch_stage0, output_path=scratch_stage1,
+                scale=scale, active_bool=active_bool, type1_mask=type1_mask, type2_mask=type2_mask,
+                feed_final_accumulators=False,
+                final_profile_acc=None, final_residual_accs=None,
+                final_lumi_sum_acc=None, final_laser_accs=None,
             )
 
-        for key, arr in data.items():
-            if isinstance(arr, np.ndarray) and arr.shape[0] == n_before:
-                data[key] = arr[mask]
-    else:
-        log.warning(
-            "[run_fill] fill %d: 'fillnum' column not found in data; proceeding without fill filtering",
-            fill,
-        )
+            # Type-1 "after" diagnostics look at the post-Type-1 data, i.e.
+            # before bunch-train is applied -- that's scratch_stage1 here,
+            # not the (bunch-train-corrected) final output.
+            post_type1_path = scratch_stage1
 
-    # filter out any nans TODO is this physically correct?
-    if not np.all(np.isfinite(data['bxraw'])):
-        mask = np.all(np.isfinite(data['bxraw']), axis=-1)
-        n_before = mask.size
-        n_after = int(mask.sum())
-        log.warning(
-            "[run_fill] fill %d: nan values found in data -> kept %d of %d rows",
-            fill,
-            n_after,
-            n_before
-        )
-        for key, arr in data.items():
-            if isinstance(arr, np.ndarray) and arr.shape[0] == n_before:
-                data[key] = arr[mask]
+            compute_bunch_train_fill(
+                fill=fill, cfg=cfg, active_mask=active_mask,
+                node=node, chunk_size=chunk_size,
+                scratch_stage1=scratch_stage1,
+            )
 
-    # TODO temporary
-    #mask = (data['runnum'] != 380196)
-    #n_before = mask.size
-    #for key, arr in data.items():
-    #    if isinstance(arr, np.ndarray) and arr.shape[0] == n_before:
-    #        data[key] = arr[mask]
+            bunch_train_make_plots = bool(getattr(cfg.bunch_train, "make_plots", False))
 
+            if bunch_train_make_plots:
+                # "before": same data the fit above just ran on.
+                analyze_bunch_train_fill_chunked(
+                    lambda: iter_hd5_row_chunks(
+                        os.path.dirname(scratch_stage1), os.path.basename(scratch_stage1),
+                        node=node, chunk_size=chunk_size,
+                    ),
+                    cfg, active_mask, fill, tag="before",
+                )
 
-    # --- 2) pipeline steps ---
-    if cfg.steps.online_recovery:
-        if cfg.type1.make_plots:
-            plot_hist_bx(data, cfg, fill, 'Online Luminosity')
-        data = recover_bxraw_step(
-            data=data,
-            cfg=cfg,
-            active_mask=active_mask,
-            fill=fill,
-            input_pattern=input_name,
-        )
+            _pass_apply_bunch_train_and_write(
+                fill=fill, cfg=cfg, active_mask=active_mask,
+                node=node, chunk_size=chunk_size,
+                scratch_stage1=scratch_stage1, output_path=output_full_path,
+                scale=scale, active_bool=active_bool, type1_mask=type1_mask, type2_mask=type2_mask,
+                final_profile_acc=final_profile_acc,
+                final_residual_accs=final_residual_accs,
+                final_lumi_sum_acc=final_lumi_sum_acc,
+                final_laser_accs=final_laser_accs,
+            )
 
-    # remove any negatives in the uncorrected data TODO is this correct?
-    if False:#not np.all(np.mean(data['bxraw'], axis=-1) >= 0):
-        mask = np.mean(data['bxraw'], axis=-1) >= 0
-        n_before = mask.size
-        n_after = int(mask.sum())
-        log.warning(
-            "[run_fill] fill %d: negative values found in uncorrected data -> kept %d of %d rows",
-            fill,
-            n_after,
-            n_before
-        )
-        for key, arr in data.items():
-            if isinstance(arr, np.ndarray) and arr.shape[0] == n_before:
-                data[key] = arr[mask]
+            if bunch_train_make_plots:
+                # "after": the bunch-train-corrected data, now in the final output.
+                analyze_bunch_train_fill_chunked(
+                    lambda: iter_hd5_row_chunks(
+                        os.path.dirname(output_full_path), os.path.basename(output_full_path),
+                        node=node, chunk_size=chunk_size,
+                    ),
+                    cfg, active_mask, fill, tag="after",
+                )
+        else:
+            post_type1_path = output_full_path
+            _pass_apply_type1_and_write(
+                fill=fill, cfg=cfg, active_mask=active_mask,
+                node=node, chunk_size=chunk_size,
+                scratch_stage0=scratch_stage0, output_path=output_full_path,
+                scale=scale, active_bool=active_bool, type1_mask=type1_mask, type2_mask=type2_mask,
+                feed_final_accumulators=True,
+                final_profile_acc=final_profile_acc,
+                final_residual_accs=final_residual_accs,
+                final_lumi_sum_acc=final_lumi_sum_acc,
+                final_laser_accs=final_laser_accs,
+            )
 
+        if need_final_residuals:
+            avg_col_f, avg_type1_f, avg_type2_f = (a.finalize() for a in final_residual_accs)
+            if make_plots:
+                plot_residuals_finalize(
+                    avg_col_f, avg_type1_f, avg_type2_f, cfg, fill, 'full_corr',
+                    n_col=int(active_bool.sum()), n_type1=int(type1_mask.sum()), n_type2=int(type2_mask.sum()),
+                )
+            if debug_after:
+                analyze_type1_fill_chunked(
+                    lambda: iter_hd5_row_chunks(
+                        os.path.dirname(post_type1_path), os.path.basename(post_type1_path),
+                        node=node, chunk_size=chunk_size,
+                    ),
+                    cfg, active_mask, fill, tag="after",
+                )
 
+        if make_plots:
+            plot_hist_bx_from_profile(final_profile_acc.mean_profile(), cfg, fill, 'T2 and T1 Corr. Luminosity')
 
-    # plot the uncorrected rates
-    # TODO also need to tell the plot which year this is
-    if cfg.type1.make_plots:
-        plot_hist_bx(data, cfg, fill, 'Uncorr. Luminosity')
+        if make_lumi_comparison_plot:
+            plot_lumi_comparison_from_series(
+                final_lumi_sum_acc.finalize(), raw_lumi_sum_acc.finalize(), cfg, fill,
+            )
 
-        # save the uncorrected rates for later comparison
-        data_origin = copy.deepcopy(data)
+        if make_laser_plots:
+            n_active = int(active_bool.sum())
+            avg_final = final_lumi_sum_acc.finalize() / n_active
+            avg_raw = raw_lumi_sum_acc.finalize() / n_active
+            laser_corr = {bcid: acc.finalize() for bcid, acc in final_laser_accs.items()}
+            laser_uncorr = {bcid: acc.finalize() for bcid, acc in raw_laser_accs.items()}
+            plot_lasers_from_series(avg_final, avg_raw, laser_corr, laser_uncorr, cfg, fill)
 
-    # --- 2b) subtract fixed mod4 pedestal BEFORE any corrections/plots/fits ---
-    if cfg.steps.restore_rates:
+    finally:
+        if not keep_scratch_on_error:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
 
-        ped4 = getattr(cfg.afterglow, "fixed_pedestal_4", None)
-        if ped4 is not None:
-            _subtract_fixed_pedestal_mod4_inplace(data, ped4)
-
-        data = restore_rates_step(data, cfg, active_mask)
-
-        # plot after t2 but before t1
-        if cfg.type1.make_plots:
-            plot_hist_bx(data, cfg, fill, 'T2 Corr. Luminosity')
-            plot_residuals(data, cfg, active_mask, fill, 't2_corr')
-    
-    if cfg.steps.compute_type1:
-        data = compute_type1_step(data, cfg, active_mask, fill)
-
-    if cfg.steps.apply_type1:
-        data = apply_type1_step(data, cfg, active_mask, fill)
-
-        # plot the corrected rates
-        # TODO also need to tell the plot which year this is
-        if cfg.type1.make_plots:
-            plot_hist_bx(data, cfg, fill, 'T2 and T1 Corr. Luminosity')
-            plot_residuals(data, cfg, active_mask, fill, 't1_t2_corr')
-    
-    if cfg.steps.bunch_train:
-        data = compute_bunch_train_step(data, cfg, active_mask, fill)
-        data = apply_bunch_train_step(data, cfg, active_mask, fill)
-
-    # recompute derived quantities (lumi, avg_raw, etc.) for safety
-    _recompute_derived_from_bxraw_inplace(data, cfg, active_mask)
-
-    # plot the corrected rates
-    # TODO likely will want to use a different flag
-    # TODO also need to tell the plot which year this is
-    if cfg.type1.make_plots:
-        plot_hist_bx(data, cfg, fill, 'Full Corr. Luminosity')
-        plot_residuals(data, cfg, active_mask, fill, 'full_corr')
-        plot_lumi_comparison(data, data_origin, cfg, active_mask, fill)
-        plot_lasers(data, data_origin, cfg, active_mask, fill)
-
-    # --- 3) save result ---
-    rows = arrays_to_rows(data)
-    save_to_hd5(rows, node=cfg.io.node, path=cfg.io.output_dir, name=output_name)
+    log.info("[run_fill] fill %d: done -> %s", fill, os.path.join(cfg.io.output_dir, output_name))
 
 
-def run_many_fills(cfg: PipelineConfig, fills: list[int]):
+def run_many_fills(cfg: PipelineConfig, fills: list[int], chunk_size: Optional[int] = None):
     """
     Run run_fill() for each fill.
 
@@ -975,21 +1105,17 @@ def run_many_fills(cfg: PipelineConfig, fills: list[int]):
 
     for fill in fills:
         try:
-            run_fill(fill, cfg)
+            run_fill(fill, cfg, chunk_size=chunk_size)
 
         except FileNotFoundError as e:
-            # Common case: missing mask, missing hd5, missing beam file, etc.
             print(f"[WARN] Fill {fill} skipped: {e}")
             failed.append(fill)
 
         except Exception as e:
-            # Any other exception — also mark as failed and continue.
             print(f"[ERROR] Fill {fill} failed with exception:")
             print(e)
-            print(traceback.format_exc())
             failed.append(fill)
 
-    # Final summary
     if failed:
         print("\n====================================")
         print("   ⚠ Some fills FAILED or SKIPPED")

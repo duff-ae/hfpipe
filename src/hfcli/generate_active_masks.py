@@ -71,70 +71,50 @@ def iter_beam_files_for_fill(beam_path: str, fill: int) -> List[str]:
 
 def build_active_mask_for_fill(beam_path: str, fill: int) -> Optional[np.ndarray]:
     """
-    Try to build an active BX mask (activeBXMask) for a given fill.
+    Build active BX mask for a fill by averaging all STABLE BEAMS collidable masks.
 
     Logic
     -----
     - Iterate over all files beam_path/<fill>/*.hd5
     - In each file, look for the /beam table
-    - In /beam, search for the first row where:
+    - Collect all rows where:
         * row["fillnum"] == fill
         * row["status"] == "STABLE BEAMS"
-    - Take row["collidable"] as the activeBXMask.
-
-    If no suitable row is found in any file, returns None.
+    - Average collidable masks over all collected rows
+    - Mark BX active if mean > 0.6
+    - Force BX >= 3480 to inactive
     """
     candidates = iter_beam_files_for_fill(beam_path, fill)
     if not candidates:
-        log.warning("[fill %d] no beam files found under %s", fill, beam_path)
         return None
 
-    log.info("[fill %d] beam candidates: %s", fill, candidates)
+    masks = []
 
     for beam_file in candidates:
-        log.info("[fill %d] opening beam file: %s", fill, beam_file)
         try:
             with tables.open_file(beam_file, mode="r") as h5:
                 if not hasattr(h5.root, "beam"):
-                    log.info("[fill %d] no /beam table in %s, skipping", fill, beam_file)
                     continue
 
                 table: tables.Table = h5.root.beam
-                log.info("[fill %d] using table '%s'", fill, table._v_pathname)
 
-                selected_mask: Optional[np.ndarray] = None
+                if "collidable" not in table.colnames:
+                    continue
 
                 for row in table.iterrows():
                     row_fill = int(row["fillnum"])
                     if row_fill != fill:
                         continue
 
-                    status_str = decode_status(row["status"])
+                    status_str = decode_status(row["status"]).strip().upper()
                     if status_str != "STABLE BEAMS":
                         continue
 
-                    coll = np.array(row["collidable"])
-                    selected_mask = coll.astype(np.int32)
-                    break
+                    coll = np.asarray(row["collidable"], dtype=np.float32)
+                    if coll.ndim != 1 or coll.size != BX_LEN:
+                        continue
 
-                if selected_mask is None:
-                    log.info(
-                        "[fill %d] no STABLE BEAMS rows with fillnum=%d in %s, trying next file",
-                        fill,
-                        fill,
-                        beam_file,
-                    )
-                    continue
-
-                if selected_mask.shape[0] != BX_LEN:
-                    log.warning(
-                        "[fill %d] collidable length=%d != BX_LEN=%d",
-                        fill,
-                        selected_mask.shape[0],
-                        BX_LEN,
-                    )
-
-                return selected_mask
+                    masks.append(coll)
 
         except Exception as e:
             log.error(
@@ -144,15 +124,18 @@ def build_active_mask_for_fill(beam_path: str, fill: int) -> Optional[np.ndarray
                 e,
                 exc_info=True,
             )
-            # Try next file
 
-    # If we get here, no suitable /beam row was found
-    log.error(
-        "[fill %d] no suitable /beam table with STABLE BEAMS found in any file",
-        fill,
-    )
-    return None
+    if not masks:
+        return None
 
+    mean_mask = np.mean(np.stack(masks, axis=0), axis=0)
+    print([x for x in mean_mask])
+    active_mask = (mean_mask > 0.2).astype(np.int32)
+
+    # No real collidable BX should exist in the orbit tail
+    active_mask[3480:] = 0
+
+    return active_mask
 
 # ----------------------------------------------------------------------
 #  CLI
