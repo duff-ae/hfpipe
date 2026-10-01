@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import traceback
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -17,13 +18,6 @@ from .io import (
     load_hd5_to_arrays,
     iter_hd5_row_chunks,
     Hd5ChunkWriter,
-    load_active_mask,
-    align_aux_by_keys,
-)
-
-from .pedestal import (
-    calculate_dynamic_pedestal,
-    subtract_fixed_pedestal_mod4_inplace,
 )
 
 from .afterglow_lsq import build_afterglow_solver_from_file, AfterglowSolver
@@ -42,6 +36,7 @@ from .bunch_train import (
     BunchTrainAccumulator,
     accumulate_bunch_train_chunk,
     analyze_bunch_train_fill_chunked,
+    _align_aux_by_keys,
 )
 from .online_recovery import reconstruct_from_tables_batch, OnlineRecoverySolver
 from .plotter import (
@@ -62,7 +57,31 @@ from .config import PipelineConfig
 
 log = logging.getLogger("hfpipe")
 
-DEFAULT_CHUNK_SIZE = 250
+DEFAULT_CHUNK_SIZE = 500
+
+def _subtract_fixed_pedestal_mod4_inplace(data: dict, ped4) -> None:
+    """
+    Subtract constant mod4 pedestal from bxraw only:
+      bxraw[:, bx] -= ped4[bx % 4]
+
+    Purely elementwise -- works on a full-fill dict or a single chunk.
+    """
+    if ped4 is None:
+        return
+
+    if "bxraw" not in data:
+        raise KeyError("fixed_pedestal_4 is set but data has no 'bxraw'")
+
+    ped4 = np.asarray(ped4, dtype=np.float32).ravel()
+    if ped4.shape[0] != 4:
+        raise ValueError(f"fixed_pedestal_4 must have length 4, got shape {ped4.shape}")
+
+    bxraw = np.asarray(data["bxraw"])
+    if bxraw.ndim != 2 or bxraw.shape[1] != BX_LEN:
+        raise ValueError(f"bxraw has shape {bxraw.shape}, expected (T, {BX_LEN})")
+
+    ped_vec = ped4[np.arange(BX_LEN) % 4][None, :]  # (1, BX_LEN)
+    data["bxraw"] = (bxraw - ped_vec).astype(bxraw.dtype, copy=False)
 
 def _recompute_derived_from_bxraw_inplace(
     data: dict,
@@ -103,6 +122,22 @@ def _recompute_derived_from_bxraw_inplace(
 
     data["avg"] = (avgraw * scale).astype(np.float32, copy=False)
 
+def calculate_dynamic_pedestal(mu_hist: np.ndarray) -> np.ndarray:
+    """
+    Exact copy of CMS dynamic pedestal logic.
+
+    We take the last 13*4 BXs (3500..3500+4*13-1 = 3500..3551),
+    group them by HF subdetector (0..3), and return pedestal[4].
+    """
+    n_sample = 13
+    pedestal = np.zeros(4, dtype=np.float32)
+    base = 3500
+    for ibx in range(4):
+        s = 0.0
+        for j in range(ibx, 4 * n_sample, 4):
+            s += mu_hist[base + j]
+        pedestal[ibx] = s / n_sample
+    return pedestal
 
 # ---------------------------------------------------------------------------
 # Helpers for Type-1 paths
@@ -194,7 +229,7 @@ def _recover_online_chunk(
     the histogram before the online pedestal/afterglow corrections.
 
     Auxiliary table alignment deliberately uses the original
-    ``align_aux_by_keys`` helper; no assumptions are made about row/chunk
+    ``_align_aux_by_keys`` helper; no assumptions are made about row/chunk
     ordering between HDF5 nodes.
     """
     bxraw_final = np.asarray(chunk["bxraw"], dtype=np.float32)
@@ -205,10 +240,10 @@ def _recover_online_chunk(
                 "online_recovery method='tables' requires pedestal and afterglow tables"
             )
 
-        pedestal_4 = align_aux_by_keys(
+        pedestal_4 = _align_aux_by_keys(
             main=chunk, aux=pedestal_data, colname="bxraw"
         ).astype(np.float32)
-        afterglow_frac = align_aux_by_keys(
+        afterglow_frac = _align_aux_by_keys(
             main=chunk, aux=afterglow_data, colname="bxraw"
         ).astype(np.float32)
 
@@ -454,14 +489,6 @@ def _pass0_prepare(
         )
         ped4 = getattr(cfg.afterglow, "fixed_pedestal_4", None)
 
-    bt_ref_data = None
-    if cfg.steps.bunch_train:
-        bt_ref_data = load_hd5_to_arrays(
-            cfg.bunch_train.linear_reference,
-            cfg.bunch_train.input_pattern.format(fill=fill),
-            node=cfg.bunch_train.node,
-        )
-
     n_rows_total = 0
 
     with Hd5ChunkWriter(scratch_stage0, node=node) as writer:
@@ -491,20 +518,13 @@ def _pass0_prepare(
 
             if cfg.steps.restore_rates:
                 if ped4 is not None:
-                    subtract_fixed_pedestal_mod4_inplace(chunk, ped4)
+                    _subtract_fixed_pedestal_mod4_inplace(chunk, ped4)
 
                 chunk = restore_rates_chunk(
                     chunk, active_mask, solver, warm_state,
                     n_jobs=cfg.afterglow.n_jobs,
                 )
                 _recompute_derived_from_bxraw_inplace(chunk, cfg, active_mask)
-
-            if cfg.steps.bunch_train:
-                bxraw_ref = align_aux_by_keys(
-                    main=chunk, aux=bt_ref_data, colname="bxraw"
-                ).astype(np.float32)
-                chunk = dict(chunk)
-                chunk["bxraw_ref"] = bxraw_ref
 
             t2_bxraw = np.asarray(chunk["bxraw"], dtype=np.float64)
             if t2_profile_acc is not None:
@@ -632,6 +652,7 @@ def compute_bunch_train_fill(
     node: str,
     chunk_size: int,
     scratch_stage1: str,
+    bt_ref_data: dict,
 ) -> str:
     """
     Fits bunch-train coefficients for the whole fill by streaming over
@@ -652,7 +673,9 @@ def compute_bunch_train_fill(
         node=node, chunk_size=chunk_size,
     ):
         bxraw_chunk = np.asarray(chunk["bxraw"], dtype=np.float64)
-        bxraw_ref_chunk = np.asarray(chunk["bxraw_ref"], dtype=np.float64)
+        bxraw_ref_chunk = _align_aux_by_keys(
+            main=chunk, aux=bt_ref_data, colname="bxraw"
+        ).astype(np.float64)
         avg_chunk = get_sbil_like_column(chunk, active_mask)
         accumulate_bunch_train_chunk(
             acc, bxraw_chunk, bxraw_ref_chunk, avg_chunk, active_mask, sbil_min,
@@ -886,7 +909,8 @@ def run_fill(
     if not os.path.exists(mask_path):
         raise FileNotFoundError(f"Active BX mask not found: {mask_path}")
 
-    active_mask = load_active_mask(mask_path, expected_len=BX_LEN)
+    with open(mask_path, "r") as f:
+        active_mask = json.load(f)
     active_mask = np.asarray(active_mask, dtype=np.int32)
 
     if active_mask.ndim != 1:
@@ -1000,10 +1024,17 @@ def run_fill(
             # not the (bunch-train-corrected) final output.
             post_type1_path = scratch_stage1
 
+            bt_ref_data = load_hd5_to_arrays(
+                cfg.bunch_train.linear_reference,
+                cfg.bunch_train.input_pattern.format(fill=fill),
+                node=cfg.bunch_train.node,
+            )
+
             compute_bunch_train_fill(
                 fill=fill, cfg=cfg, active_mask=active_mask,
                 node=node, chunk_size=chunk_size,
                 scratch_stage1=scratch_stage1,
+                bt_ref_data=bt_ref_data,
             )
 
             bunch_train_make_plots = bool(getattr(cfg.bunch_train, "make_plots", False))
@@ -1015,7 +1046,7 @@ def run_fill(
                         os.path.dirname(scratch_stage1), os.path.basename(scratch_stage1),
                         node=node, chunk_size=chunk_size,
                     ),
-                    cfg, active_mask, fill, tag="before",
+                    cfg, bt_ref_data, active_mask, fill, tag="before",
                 )
 
             _pass_apply_bunch_train_and_write(
@@ -1036,7 +1067,7 @@ def run_fill(
                         os.path.dirname(output_full_path), os.path.basename(output_full_path),
                         node=node, chunk_size=chunk_size,
                     ),
-                    cfg, active_mask, fill, tag="after",
+                    cfg, bt_ref_data, active_mask, fill, tag="after",
                 )
         else:
             post_type1_path = output_full_path
@@ -1113,7 +1144,7 @@ def run_many_fills(cfg: PipelineConfig, fills: list[int], chunk_size: Optional[i
 
         except Exception as e:
             print(f"[ERROR] Fill {fill} failed with exception:")
-            print(e)
+            print(traceback.format_exc())
             failed.append(fill)
 
     if failed:

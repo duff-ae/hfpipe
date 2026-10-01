@@ -21,6 +21,43 @@ log = logging.getLogger("hfpipe.bunch_train")
 # Helpers for bunch train coefficient extraction
 # ---------------------------------------------------------------------------
 
+def _align_aux_by_keys(
+    main: Dict[str, np.ndarray],
+    aux: Dict[str, np.ndarray],
+    colname: str,
+) -> np.ndarray:
+
+    keys = ("fillnum", "runnum", "lsnum", "nbnum")
+
+    T = main[keys[0]].shape[0]
+    main_key = np.stack([main[k].astype(np.int64) for k in keys], axis=1)  # (T, 4)
+
+    aux_T = aux[keys[0]].shape[0]
+    aux_key = np.stack([aux[k].astype(np.int64) for k in keys], axis=1)    # (aux_T, 4)
+
+    index: Dict[tuple, int] = {}
+    for j in range(aux_T):
+        index[tuple(aux_key[j])] = j
+
+    aux_col = aux[colname]
+    tail_shape = aux_col.shape[1:]
+
+    out = np.zeros((T,) + tail_shape, dtype=aux_col.dtype)
+
+    missing = 0
+    for i in range(T):
+        key = tuple(main_key[i])
+        j = index.get(key, None)
+        if j is None:
+            missing += 1
+            continue
+        out[i] = aux_col[j]
+
+    if missing > 0:
+        print(f"[WARN] _align_aux_by_keys: {missing} rows had no match in aux node")
+
+    return out
+
 def _find_head(heads, idx):
     """
     Find the head bx associated with the given tail bx
@@ -488,6 +525,7 @@ def analyze_bunch_train_finalize(
 def analyze_bunch_train_fill_chunked(
     chunks_iter_factory,
     cfg,
+    bt_ref_data: dict,
     active_mask: np.ndarray,
     fill: int,
     tag: str = "before",
@@ -522,7 +560,9 @@ def analyze_bunch_train_fill_chunked(
 
     for chunk in chunks_iter_factory():
         bxraw_chunk = np.asarray(chunk["bxraw"], dtype=np.float64)
-        bxraw_ref_chunk = np.asarray(chunk["bxraw_ref"], dtype=np.float64)
+        bxraw_ref_chunk = _align_aux_by_keys(
+            main=chunk, aux=bt_ref_data, colname="bxraw"
+        ).astype(np.float64)
         avg_chunk = get_sbil_like_column(chunk, active_mask)
         acc.add_chunk(bxraw_chunk, bxraw_ref_chunk, avg_chunk, scale)
 
