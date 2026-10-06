@@ -4,6 +4,8 @@ data/**
 out/**
 *.out
 *.png
+env/**
+condor/submissions/**
 
 # test scripts
 run_tests.sh

@@ -7,9 +7,10 @@ CONFIG=$1
 FILL=$2
 
 # TODO: adjust to your environment
-cd /eos/user/a/alshevel/hfpipe
+cd /eos/user/l/leeja/HF/hfpipe
 
 # --- venv environment for lxplus ---
-source /eos/user/a/alshevel/hfpipe/venv/bin/activate
+export PATH=/cvmfs/cms-bril.cern.ch/brilconda310/bin:$PATH
+source /eos/user/l/leeja/HF/hfpipe/env/bin/activate
 
 python -m hfcli.run_pipeline --config "$CONFIG" --fills "$FILL"

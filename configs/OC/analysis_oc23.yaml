@@ -80,7 +80,7 @@ type1:
 
 bunch_train:
   # location of data to use as a linear reference for the bunch train effect
-  linear_reference: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/23/"
+  linear_reference: "/cephfs/brilshare/alshevel/hf_reprocessed/hfet/23_fixed/"
   input_pattern: "{fill}/{fill}.hd5"
   node: "hfetlumi"
 
