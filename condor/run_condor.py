@@ -13,17 +13,18 @@ from pathlib import Path
 # Configuration — edit for your setup
 # ----------------------------------------------------------------------
 
-CONFIG_YAML = "configs/OC/analysis_oc22_part1.yaml"
-WORKDIR = "/cephfs/brilshare/leeja/hfpipe"
+CONFIG_YAML = "configs/OC/analysis_oc23_retry.yaml"
+WORKDIR = "/afs/cern.ch/user/l/leeja/private/hfpipe"
 EXECUTABLE = "condor/pipeline.sh"
 
-SUBMIT_DIR = Path("/cephfs/brilshare/leeja/hfpipe/condor/submissions")
-LOG_DIR = Path("/cephfs/brilshare/leeja/hfpipe/condor/logs")
+SUBMIT_DIR = Path("/afs/cern.ch/user/l/leeja/private/hfpipe/condor/submissions")
+LOG_DIR = Path("/afs/cern.ch/user/l/leeja/private/hfpipe/condor/logs")
 
 JOB_FLAVOUR = "workday"  # espresso / microcentury / longlunch / workday / tomorrow ...
 ACCOUNTING_GROUP = "group_u_CMS.CAF.COMM"  # TODO: your accounting group
+MEMORY           = 32000
 
-MAX_JOBS_PER_SUBMIT = 1  # split into several .sub files if FILLS is huge
+MAX_JOBS_PER_SUBMIT = 200  # split into several .sub files if FILLS is huge
 
 # ----------------------------------------------------------------------
 
@@ -41,8 +42,9 @@ output     = {LOG_DIR}/$(job_name).out
 error      = {LOG_DIR}/$(job_name).err
 log        = {LOG_DIR}/$(job_name).log
 
+request_memory = {MEMORY}
+
 +JobFlavour = "{JOB_FLAVOUR}"
-+AccountingGroup = "{ACCOUNTING_GROUP}"
 
 should_transfer_files = YES
 when_to_transfer_output = ON_EXIT
@@ -59,7 +61,6 @@ def main() -> None:
     fills = sorted(set(get_fills()))
     if not fills:
         raise RuntimeError("No fills to submit")
-    fills = [8016] #TODO
     
     n_parts = (len(fills) + MAX_JOBS_PER_SUBMIT - 1) // MAX_JOBS_PER_SUBMIT
 
