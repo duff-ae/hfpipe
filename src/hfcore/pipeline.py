@@ -498,8 +498,6 @@ def _pass0_prepare(
         ):
             raw_bxraw = np.asarray(chunk["bxraw"], dtype=np.float64)
 
-            if raw_profile_acc is not None:
-                raw_profile_acc.add_chunk(raw_bxraw)
             if raw_lumi_sum_acc is not None:
                 raw_lumi_sum_acc.add(compute_scaled_active_sum_chunk(raw_bxraw, active_bool, scale))
             if raw_laser_accs is not None:
@@ -515,6 +513,9 @@ def _pass0_prepare(
                     afterglow_data=online_aft_data,
                     online_solver=online_solver,
                 )
+            raw_bxraw = np.asarray(chunk["bxraw"], dtype=np.float64)
+            if raw_profile_acc is not None:
+                raw_profile_acc.add_chunk(raw_bxraw)
 
             if cfg.steps.restore_rates:
                 if ped4 is not None:

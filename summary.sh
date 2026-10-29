@@ -1,10 +1,18 @@
 python3 plot_residual_year_summary.py \
-  --input-dir /eos/user/l/leeja/HF/plots_hfpipe/OC/24 \
-  --output-dir /eos/user/l/leeja/HF/plots_hfpipe/OC/summary_24 \
-  --year 2024 \
-  --max-fill 10232 \
+  --input-dir /eos/user/l/leeja/HF/plots_hfpipe/OC/25 \
+  --output-dir /eos/user/l/leeja/HF/plots_hfpipe/OC/summary_25 \
+  --year 2025 \
+  --max-fill 99999 \
   --trim-frac 0.10 \
   --residual-threshold .2
+
+#python3 plot_residual_year_summary.py \
+#  --input-dir /eos/user/l/leeja/HF/plots_hfpipe/OC/24 \
+#  --output-dir /eos/user/l/leeja/HF/plots_hfpipe/OC/summary_24 \
+#  --year 2024 \
+#  --max-fill 10232 \
+#  --trim-frac 0.10 \
+#  --residual-threshold .2
 
 #python3 plot_residual_year_summary.py \
 #  --input-dir /eos/user/l/leeja/HF/plots_hfpipe/OC/23 \
